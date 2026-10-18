@@ -1,0 +1,389 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index a5ce2eb..71b0199 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -204,6 +204,9 @@ baselineProfile {
+ dependencies {
+     baselineProfile(projects.baselineProfile)
+ 
++    // Voice listen mode: on-device OCR for speech bubbles
++    implementation("com.google.mlkit:text-recognition:16.0.1")
++
+     implementation(projects.i18n)
+     implementation(projects.icons.customMaterialSymbols)
+     implementation(projects.icons.materialSymbols)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/ReaderActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/ReaderActivity.kt
+index 108a9e3..8bffe5b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/ReaderActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/ReaderActivity.kt
+@@ -72,6 +72,7 @@ import eu.kanade.tachiyomi.ui.reader.setting.ReaderOrientation
+ import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+ import eu.kanade.tachiyomi.ui.reader.setting.ReaderSettingsViewModel
+ import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
++import eu.kanade.tachiyomi.ui.reader.voice.addVoiceListenButton
+ import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
+ import eu.kanade.tachiyomi.ui.reader.viewer.pager.R2LPagerViewer
+ import eu.kanade.tachiyomi.ui.reader.viewer.webgpu.WebGpuViewer
+@@ -168,6 +169,7 @@ class ReaderActivity : BaseActivity() {
+         binding = ReaderActivityBinding.inflate(layoutInflater)
+         setContentView(binding.root)
+         binding.setComposeOverlay()
++        addVoiceListenButton(this, binding.root, binding.viewerContainer)
+ 
+         if (!viewModel.hasValidArgs) {
+             finish()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt
+new file mode 100644
+index 0000000..65b774e
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt
+@@ -0,0 +1,349 @@
++package eu.kanade.tachiyomi.ui.reader.voice
++
++import android.app.Activity
++import android.app.AlertDialog
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Rect
++import android.graphics.drawable.GradientDrawable
++import android.os.Handler
++import android.os.Looper
++import android.speech.tts.TextToSpeech
++import android.speech.tts.UtteranceProgressListener
++import android.speech.tts.Voice
++import android.text.TextUtils
++import android.view.Gravity
++import android.view.View
++import android.view.ViewGroup
++import android.widget.Button
++import android.widget.CheckBox
++import android.widget.FrameLayout
++import android.widget.LinearLayout
++import android.widget.ScrollView
++import android.widget.TextView
++import android.widget.Toast
++import com.google.mlkit.vision.common.InputImage
++import com.google.mlkit.vision.text.TextRecognition
++import com.google.mlkit.vision.text.latin.TextRecognizerOptions
++import java.util.Locale
++import kotlin.math.abs
++
++/**
++ * Voice "Listen" mode for the reader.
++ *
++ * Adds a floating Listen button. Tapping it captures the page currently on screen, finds the text
++ * (speech bubbles) with on-device OCR, and shows a list where each bubble can be given a speaker
++ * (Girl / Boy / Narrator / Skip). Bubbles are then read aloud with the phone's text-to-speech.
++ *
++ * English text only for now (Latin OCR model).
++ */
++fun addVoiceListenButton(activity: Activity, root: ViewGroup, source: View) {
++    val d = activity.resources.displayMetrics.density
++    val button = TextView(activity).apply {
++        text = "🔊 Listen"
++        setTextColor(Color.WHITE)
++        textSize = 14f
++        gravity = Gravity.CENTER
++        setPadding((16 * d).toInt(), (10 * d).toInt(), (16 * d).toInt(), (10 * d).toInt())
++        background = GradientDrawable().apply {
++            cornerRadius = 100f * d
++            setColor(0xB3000000.toInt())
++        }
++        elevation = 8f * d
++        setOnClickListener { VoiceSession.start(activity, source) }
++    }
++    val params = FrameLayout.LayoutParams(
++        ViewGroup.LayoutParams.WRAP_CONTENT,
++        ViewGroup.LayoutParams.WRAP_CONTENT,
++        Gravity.BOTTOM or Gravity.END,
++    ).apply {
++        setMargins(0, 0, (16 * d).toInt(), (120 * d).toInt())
++    }
++    root.addView(button, params)
++}
++
++private enum class Speaker(val label: String, val pitch: Float, val rate: Float) {
++    GIRL("Girl", 1.25f, 1.0f),
++    BOY("Boy", 0.8f, 1.0f),
++    NARRATOR("Narrator", 1.0f, 0.95f),
++    SKIP("Skip", 1.0f, 1.0f),
++    ;
++
++    fun next(): Speaker = entries[(ordinal + 1) % entries.size]
++}
++
++private class Bubble(val text: String, val box: Rect, var speaker: Speaker = Speaker.GIRL)
++
++private object VoiceSession {
++
++    fun start(activity: Activity, source: View) {
++        if (source.width <= 0 || source.height <= 0) {
++            toast(activity, "Page is not ready yet")
++            return
++        }
++        val bitmap = try {
++            Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
++        } catch (e: Throwable) {
++            toast(activity, "Not enough memory to read this page")
++            return
++        }
++        val canvas = Canvas(bitmap)
++        canvas.drawColor(Color.WHITE)
++        source.draw(canvas)
++
++        toast(activity, "Reading page...")
++        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
++        recognizer.process(InputImage.fromBitmap(bitmap, 0))
++            .addOnSuccessListener { result ->
++                val bubbles = result.textBlocks.mapNotNull { block ->
++                    val box = block.boundingBox ?: return@mapNotNull null
++                    val text = block.text.replace("-\n", "").replace('\n', ' ').trim()
++                    if (text.count { it.isLetter() } < 2) null else Bubble(text, box)
++                }
++                bitmap.recycle()
++                recognizer.close()
++                if (bubbles.isEmpty()) {
++                    toast(activity, "No text found on this page")
++                } else if (!activity.isFinishing) {
++                    VoiceDialog(activity, bubbles).show()
++                }
++            }
++            .addOnFailureListener {
++                bitmap.recycle()
++                recognizer.close()
++                toast(activity, "Could not read this page")
++            }
++    }
++}
++
++private fun toast(activity: Activity, message: String) {
++    Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
++}
++
++private class VoicePlayer(private val activity: Activity) {
++
++    private var tts: TextToSpeech? = null
++    private var ready = false
++    private val handler = Handler(Looper.getMainLooper())
++    private var queue: List<Bubble> = emptyList()
++    private var index = 0
++    private var playing = false
++    private var girlVoice: Voice? = null
++    private var boyVoice: Voice? = null
++    private var defaultVoice: Voice? = null
++
++    init {
++        tts = TextToSpeech(activity.applicationContext) { status ->
++            if (status == TextToSpeech.SUCCESS) {
++                val engine = tts
++                engine?.setLanguage(Locale.US)
++                pickVoices(engine)
++                engine?.setOnUtteranceProgressListener(
++                    object : UtteranceProgressListener() {
++                        override fun onStart(utteranceId: String?) {}
++
++                        override fun onDone(utteranceId: String?) {
++                            handler.post {
++                                index++
++                                speakCurrent()
++                            }
++                        }
++
++                        @Deprecated("Deprecated in Java")
++                        override fun onError(utteranceId: String?) {
++                            handler.post { stop() }
++                        }
++                    },
++                )
++                ready = true
++            } else {
++                toast(activity, "Text-to-speech is not available on this phone")
++            }
++        }
++    }
++
++    private fun pickVoices(engine: TextToSpeech?) {
++        try {
++            defaultVoice = engine?.defaultVoice
++            val english = (engine?.voices ?: emptySet()).filter {
++                it.locale.language == "en" && !it.isNetworkConnectionRequired
++            }
++            girlVoice = english.firstOrNull { it.name.contains("female", ignoreCase = true) }
++            boyVoice = english.firstOrNull {
++                it.name.contains("male", ignoreCase = true) && !it.name.contains("female", ignoreCase = true)
++            }
++        } catch (e: Throwable) {
++            // Fall back to pitch changes only.
++        }
++    }
++
++    fun playAll(bubbles: List<Bubble>) = play(bubbles)
++
++    fun playOne(bubble: Bubble) = play(listOf(bubble))
++
++    private fun play(bubbles: List<Bubble>) {
++        if (!ready) {
++            toast(activity, "Voice is still loading, try again in a moment")
++            return
++        }
++        tts?.stop()
++        queue = bubbles
++        index = 0
++        playing = true
++        speakCurrent()
++    }
++
++    private fun speakCurrent() {
++        if (!playing) return
++        val engine = tts ?: return
++        while (index < queue.size && queue[index].speaker == Speaker.SKIP) index++
++        val bubble = queue.getOrNull(index)
++        if (bubble == null) {
++            playing = false
++            return
++        }
++        val speaker = bubble.speaker
++        val voice = when (speaker) {
++            Speaker.GIRL -> girlVoice
++            Speaker.BOY -> boyVoice
++            else -> null
++        }
++        if (voice != null) {
++            engine.setVoice(voice)
++            engine.setPitch(1.0f)
++        } else {
++            defaultVoice?.let { engine.setVoice(it) }
++            engine.setPitch(speaker.pitch)
++        }
++        engine.setSpeechRate(speaker.rate)
++        engine.speak(bubble.text, TextToSpeech.QUEUE_FLUSH, null, "bubble-$index")
++    }
++
++    fun stop() {
++        playing = false
++        tts?.stop()
++    }
++
++    fun shutdown() {
++        playing = false
++        tts?.stop()
++        tts?.shutdown()
++        tts = null
++    }
++}
++
++private class VoiceDialog(private val activity: Activity, private val bubbles: List<Bubble>) {
++
++    private var rightToLeft = true
++    private val player = VoicePlayer(activity)
++    private val list = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
++    private val density = activity.resources.displayMetrics.density
++
++    private fun dp(value: Int) = (value * density).toInt()
++
++    /** Rough reading order: rows from top to bottom, then left/right inside each row. */
++    private fun ordered(): List<Bubble> {
++        val rows = mutableListOf<MutableList<Bubble>>()
++        for (bubble in bubbles.sortedBy { it.box.centerY() }) {
++            val row = rows.lastOrNull()
++            if (row != null && abs(bubble.box.centerY() - row[0].box.centerY()) < row[0].box.height()) {
++                row.add(bubble)
++            } else {
++                rows.add(mutableListOf(bubble))
++            }
++        }
++        return rows.flatMap { row ->
++            if (rightToLeft) row.sortedByDescending { it.box.centerX() } else row.sortedBy { it.box.centerX() }
++        }
++    }
++
++    private fun render() {
++        list.removeAllViews()
++        for (bubble in ordered()) {
++            val row = LinearLayout(activity).apply {
++                orientation = LinearLayout.HORIZONTAL
++                gravity = Gravity.CENTER_VERTICAL
++                setPadding(0, dp(4), 0, dp(4))
++            }
++            val who = Button(activity).apply {
++                text = bubble.speaker.label
++                isAllCaps = false
++                setOnClickListener {
++                    bubble.speaker = bubble.speaker.next()
++                    text = bubble.speaker.label
++                }
++            }
++            val line = TextView(activity).apply {
++                text = bubble.text
++                maxLines = 3
++                ellipsize = TextUtils.TruncateAt.END
++                setPadding(dp(8), 0, 0, 0)
++                setOnClickListener { player.playOne(bubble) }
++            }
++            row.addView(who, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
++            row.addView(line, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
++            list.addView(row)
++        }
++    }
++
++    fun show() {
++        val root = LinearLayout(activity).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(dp(16), dp(8), dp(16), 0)
++        }
++        val hint = TextView(activity).apply {
++            text = "Tap the name to change who speaks. Tap a line to hear just that one."
++        }
++        val orderBox = CheckBox(activity).apply {
++            text = "Right-to-left order"
++            isChecked = true
++            setOnCheckedChangeListener { _, checked ->
++                rightToLeft = checked
++                render()
++            }
++        }
++        val scroll = ScrollView(activity).apply { addView(list) }
++
++        val dialog = AlertDialog.Builder(activity)
++            .setTitle("Listen")
++            .setView(root)
++            .setOnDismissListener { player.shutdown() }
++            .create()
++
++        val buttons = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
++        val play = Button(activity).apply {
++            text = "Play all"
++            isAllCaps = false
++            setOnClickListener { player.playAll(ordered()) }
++        }
++        val stop = Button(activity).apply {
++            text = "Stop"
++            isAllCaps = false
++            setOnClickListener { player.stop() }
++        }
++        val close = Button(activity).apply {
++            text = "Close"
++            isAllCaps = false
++            setOnClickListener { dialog.dismiss() }
++        }
++        val weight = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
++        buttons.addView(play, weight)
++        buttons.addView(stop, LinearLayout.LayoutParams(weight))
++        buttons.addView(close, LinearLayout.LayoutParams(weight))
++
++        root.addView(hint)
++        root.addView(orderBox)
++        root.addView(
++            scroll,
++            LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT,
++                (activity.resources.displayMetrics.heightPixels * 0.45f).toInt(),
++            ),
++        )
++        root.addView(buttons)
++
++        render()
++        dialog.show()
++    }
++}
