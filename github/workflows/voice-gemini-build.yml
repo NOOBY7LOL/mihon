@@ -1,0 +1,41 @@
+name: Build voice APK (Gemini)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'voice-gemini-v*.patch'
+      - '.github/workflows/voice-gemini-build.yml'
+
+jobs:
+  build:
+    name: Build debug APK with Gemini voice mode
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Apply the newest voice patch
+        run: |
+          PATCH=$(ls voice-gemini-v*.patch | sort -V | tail -1)
+          echo "Applying $PATCH"
+          git apply --verbose "$PATCH"
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version-file: .github/.java-version
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-mihon-gemini-apk
+          path: app/build/outputs/apk/debug/*.apk
