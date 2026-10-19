@@ -1,4 +1,4 @@
-name: Build & Test
+Name: Build & Test
 on:
   pull_request:
     paths:
@@ -23,7 +23,7 @@ permissions:
 jobs:
   build:
     name: Build & Test App
-    runs-on: 'ubuntu-26.04'
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -75,3 +75,4 @@ jobs:
         with:
           name: mapping-${{ github.sha }}
           path: app/build/outputs/mapping/release
+          
