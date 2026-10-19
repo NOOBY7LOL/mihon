@@ -55,13 +55,13 @@ index 0000000..eda58ee
 +import java.net.HttpURLConnection
 +import java.net.URL
 +
-+/** An error from Google's servers, with a message that can be shown to the reader. */
++/** An error from Google's servers, with a message that can be shown to the reader[span_1](start_span)[span_1](end_span). */
 +internal class GeminiException(message: String, val code: Int = 0) : Exception(message)
 +
 +/**
-+ * Minimal client for the Gemini REST API (no extra libraries).
-+ * - [analyzePage] sends a manga page and gets back each line of text with who says it.
-+ * - [synthesize] turns text into speech with one of Gemini's voices (raw 24 kHz 16-bit mono PCM).
++ * Minimal client for the Gemini REST API (no extra libraries)[span_2](start_span)[span_2](end_span).
++ * - [analyzePage] sends a manga page and gets back each line of text with who says it[span_3](start_span)[span_3](end_span).
++ * - [synthesize] turns text into speech with one of Gemini's voices (raw 24 kHz 16-bit mono PCM)[span_4](start_span)[span_4](end_span).
 + */
 +internal object GeminiClient {
 +
@@ -97,13 +97,13 @@ index 0000000..eda58ee
 +        val response = try {
 +            post(url, apiKey, body(true), 120_000)
 +        } catch (e: GeminiException) {
-+            // Some models do not accept a thinking level; try once more without it.
++            // Some models do not accept a thinking level; try once more without it[span_5](start_span)[span_5](end_span).
 +            if (e.code == 400) post(url, apiKey, body(false), 120_000) else throw e
 +        }
 +        return parseLines(response)
 +    }
 +
-+    /** Asks Google which models this key can use and picks a good one (Flash, newest, stable first). */
++    /** Asks Google which models this key can use and picks a good one (Flash, newest, stable first)[span_6](start_span)[span_6](end_span). */
 +    fun pickModel(apiKey: String, tts: Boolean): String? {
 +        val connection = URL("${BASE.trimEnd('/')}?pageSize=200").openConnection() as HttpURLConnection
 +        val names = ArrayList<String>()
@@ -144,7 +144,7 @@ index 0000000..eda58ee
 +        ).firstOrNull()
 +    }
 +
-+    /** One or two (label, voiceName) pairs. Two voices use Gemini's multi-speaker mode. */
++    /** One or two (label, voiceName) pairs. Two voices use Gemini's multi-speaker mode[span_7](start_span)[span_7](end_span). */
 +    private fun speechBody(voices: List<Pair<String, String>>, text: String): JSONObject {
 +        fun voiceConfig(name: String) =
 +            JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", name))
@@ -188,7 +188,7 @@ index 0000000..eda58ee
 +        return result
 +    }
 +
-+    /** Whole answer at once (used if streaming is not accepted). */
++    /** Whole answer at once (used if streaming is not accepted)[span_8](start_span)[span_8](end_span). */
 +    fun synthesize(apiKey: String, model: String, voices: List<Pair<String, String>>, text: String): ByteArray {
 +        val response = post("$BASE$model:generateContent", apiKey, speechBody(voices, text), 90_000)
 +        val chunks = audioOf(response)
@@ -199,8 +199,8 @@ index 0000000..eda58ee
 +    }
 +
 +    /**
-+     * Streams the speech: [onChunk] gets raw PCM pieces as soon as Google makes them
-+     * and returns false to cancel. Returns how many bytes arrived.
++     * Streams the speech: [onChunk] gets raw PCM pieces as soon as Google makes them[span_9](start_span)[span_9](end_span)
++     * and returns false to cancel. Returns how many bytes arrived[span_10](start_span)[span_10](end_span).
 +     */
 +    fun synthesizeStream(
 +        apiKey: String,
@@ -213,6 +213,214 @@ index 0000000..eda58ee
 +        var total = 0
 +        try {
 +            connection.requestMethod = "POST"
++            connection.connectTimeout = 20_000
++            connection.readTimeout = 90_000
++            connection.doOutput = true
++            connection.setRequestProperty("Content-Type", "application/json")
++            connection.setRequestProperty("x-goog-api-key", apiKey)
++            connection.outputStream.use {
++                it.write(speechBody(voices, text).toString().toByteArray(Charsets.UTF_8))
++            }
++            val code = connection.responseCode
++            if (code !in 200..299) {
++                val error = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
++                throw GeminiException(friendly(error, code), code)
++            }
++            connection.inputStream.bufferedReader().use { reader ->
++                while (true) {
++                    val line = reader.readLine() ?: break
++                    if (!line.startsWith("data:")) continue
++                    val json = line.substring(5).trim()
++                    if (json.isEmpty()) continue
++                    for (chunk in audioOf(JSONObject(json))) {
++                        total += chunk.size
++                        if (!onChunk(chunk)) return total
++                    }
++                }
++            }
++        } finally {
++            connection.disconnect()
++        }
++        return total
++    }
++
++    private fun buildPrompt(cast: String, context: String): String {
++        val characters = cast.trim().ifEmpty { "not provided" }
++        val builder = StringBuilder()
++        builder.append("You are helping a text-to-speech reader for an English manga page. ")
++        builder.append("List every line of dialogue, thought and narration on this page in the correct reading order. ")
++        builder.append("Manga is read right to left and top to bottom unless the page is clearly laid out left to right. ")
++        builder.append("For each line give the text exactly as printed, but write it as a normal sentence, not in ALL CAPS, ")
++        builder.append("and say who speaks it: \"girl\" (a female character), \"boy\" (a male character), ")
++        builder.append("\"narrator\" (narration boxes and captions), or \"unsure\" if you cannot tell. ")
++        builder.append("Use these clues: which character the bubble tail points to, who is in the panel, ")
++        builder.append("names used when someone is addressed (the person addressed is usually not the speaker), ")
++        builder.append("and how the conversation alternates between characters. ")
++        builder.append("Skip sound effects and background signs unless they are spoken. ")
++        builder.append("Do not invent text that is not on the page.\n")
++        builder.append("Characters: ").append(characters).append("\n")
++        if (context.isNotBlank()) {
++            builder.append("The last lines from the previous page, for context only (do not repeat them):\n")
++            builder.append(context).append("\n")
++        }
++        builder.append("Reply with ONLY JSON in exactly this form: ")
++        builder.append("{\"lines\":[{\"text\":\"...\",\"speaker\":\"girl|boy|narrator|unsure\"}]}")
++        return builder.toString()
++    }
++
++    private fun parseLines(response: JSONObject): List<Pair<String, String>> {
++        val parts = response.optJSONArray("candidates")
++            ?.optJSONObject(0)
++            ?.optJSONObject("content")
++            ?.optJSONArray("parts")
++            ?: throw GeminiException("Gemini sent no answer for this page. Try again")
++
++        val raw = StringBuilder()
++        for (i in 0 until parts.length()) {
++            val part = parts.optJSONObject(i) ?: continue
++            if (!part.optBoolean("thought", false)) raw.append(part.optString("text", ""))
++        }
++        var text = raw.toString().trim()
++        if (text.startsWith("```")) {
++            text = text.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
++        }
++        val array = if (text.startsWith("[")) {
++            JSONArray(text)
++        } else {
++            JSONObject(text).optJSONArray("lines") ?: JSONArray()
++        }
++
++        val lines = ArrayList<Pair<String, String>>()
++        for (i in 0 until array.length()) {
++            val item = array.optJSONObject(i) ?: continue
++            val lineText = item.optString("text", "").trim()
++            if (lineText.isNotEmpty()) {
++                lines.add(lineText to item.optString("speaker", "unsure").trim().lowercase())
++            }
++        }
++        return lines
++    }
++
++    private fun post(url: String, apiKey: String, body: JSONObject, readTimeoutMs: Int): JSONObject {
++        val connection = URL(url).openConnection() as HttpURLConnection
++        try {
++            connection.requestMethod = "POST"
++            connection.connectTimeout = 20_000
++            connection.readTimeout = readTimeoutMs
++            connection.doOutput = true
++            connection.setRequestProperty("Content-Type", "application/json")
++            connection.setRequestProperty("x-goog-api-key", apiKey)
++            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
++
++            val code = connection.responseCode
++            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
++            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
++            if (code !in 200..299) throw GeminiException(friendly(text, code), code)
++            return JSONObject(text)
++        } finally {
++            connection.disconnect()
++        }
++    }
++
++    private fun friendly(text: String, code: Int): String {
++        val detail = try {
++            JSONObject(text).optJSONObject("error")?.optString("message")
++        } catch (e: Exception) {
++            null
++        }
++        return when (code) {
++            429 -> "Free limit reached. Switching model..."
++            503 -> "Google servers busy (high demand). Switching model..."
++            401, 403 -> "Google rejected the key. Check it in settings"
++            404 -> "Model name not found. Check it in settings"
++            400 -> detail?.takeIf { it.isNotBlank() } ?: "Google could not accept the request"
++            else -> "Google error $code" + (detail?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: "")
++        }
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt
+new file mode 100644
+index 0000000..8681820
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt
+@@ -0,0 +1,1117 @@
++package eu.kanade.tachiyomi.ui.reader.voice
++
++import android.app.Activity
++import android.app.AlertDialog
++import android.content.Context
++import android.content.SharedPreferences
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.graphics.Color
++import android.graphics.Rect
++import android.graphics.Typeface
++import android.graphics.drawable.GradientDrawable
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioTrack
++import android.os.Handler
++import android.os.Looper
++import android.speech.tts.TextToSpeech
++import android.speech.tts.UtteranceProgressListener
++import android.speech.tts.Voice
++import android.text.InputType
++import android.text.TextUtils
++import android.util.TypedValue
++import android.view.Gravity
++import android.view.PixelCopy
++import android.view.View
++import android.view.ViewGroup
++import android.widget.Button
++import android.widget.CheckBox
++import android.widget.EditText
++import android.widget.FrameLayout
++import android.widget.LinearLayout
++import android.widget.ScrollView
++import android.widget.TextView
++import android.widget.Toast
++import java.io.ByteArrayOutputStream
++import java.io.IOException
++import java.io.InputStream
++import java.util.Locale
++import java.util.concurrent.Executors
++import kotlin.math.PI
++import kotlin.math.abs
++import kotlin.math.exp
++import kotlin.math.sin
++
++/** The page currently shown in the reader: a key for caching and a way to open the original image[span_11](start_span)[span_11](end_span). */
++class VoicePage(val key: String, val stream: (() -> InputStream)?)
++
++/**
++ * Voice mode for the reader. Adds a small bar at the bottom of the screen[span_12](start_span)[span_12](end_span):
++ * - Listen: sends the current page to Gemini, which returns each line of text and who says it[span_13](start_span)[span_13](end_span)
++ *   (girl, boy, narrator or unsure). Each line is then read in the matching voice[span_14](start_span)[span_14](end_span).
++ *   Hold Listen to see the lines and fix who speaks any of them[span_15](start_span)[span_15](end_span).
++ * - Stop: stops speaking (or cancels reading the page)[span_16](start_span)[span_16](end_span).
++ * - Settings: your free Google key, models, voices and a short cast description[span_17](start_span)[span_17](end_span).
++ *
++ * Returns the bar so the reader can hide it while its own menus are showing[span_18](start_span)[span_18](end_span).
++ */
++fun addVoiceListenButton(
++    activity: Activity,
++    root: ViewGroup,
++    source: View,
++    currentPage: () -> VoicePage?,
++): View {
++    return VoiceUi(activity, root, source, currentPage).install()
++}
++
++private enum class Speaker(
++    val label: String,
++    val emoji: String,
++    val color: Int,
++    val pitch: Float,
++    val rate: Float,
++) {
++    GIRL("Girl", "👧", 0xFFE91E8C.toInt(), 1.25f, 1.0f),
++    BOY("Boy", "👦", 0xFF1E88E5.toInt(), 0.8f, 1.0f),
++    NARRATOR("Narhod = "POST"
 +            connection.connectTimeout = 20_000
 +            connection.readTimeout = 90_000
 +            connection.doOutput = true
