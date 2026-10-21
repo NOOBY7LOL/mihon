@@ -1,0 +1,2605 @@
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/ReaderActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/ReaderActivity.kt
+index 108a9e3..8b7971f 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/ReaderActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/ReaderActivity.kt
+@@ -72,6 +72,8 @@ import eu.kanade.tachiyomi.ui.reader.setting.ReaderOrientation
+ import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+ import eu.kanade.tachiyomi.ui.reader.setting.ReaderSettingsViewModel
+ import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
++import eu.kanade.tachiyomi.ui.reader.voice.VoicePage
++import eu.kanade.tachiyomi.ui.reader.voice.addVoiceListenButton
+ import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
+ import eu.kanade.tachiyomi.ui.reader.viewer.pager.R2LPagerViewer
+ import eu.kanade.tachiyomi.ui.reader.viewer.webgpu.WebGpuViewer
+@@ -137,6 +139,8 @@ class ReaderActivity : BaseActivity() {
+ 
+     private var loadingIndicator: ReaderProgressIndicator? = null
+ 
++    private var voiceBar: View? = null
++
+     var isScrollingThroughPages = false
+         private set
+ 
+@@ -168,6 +172,12 @@ class ReaderActivity : BaseActivity() {
+         binding = ReaderActivityBinding.inflate(layoutInflater)
+         setContentView(binding.root)
+         binding.setComposeOverlay()
++        voiceBar = addVoiceListenButton(this, binding.root, binding.viewerContainer) { offset ->
++            val readerState = viewModel.state.value
++            val chapter = readerState.currentChapter
++            val page = chapter?.pages?.getOrNull(readerState.currentPage - 1 + offset)
++            if (chapter == null || page == null) null else VoicePage("${chapter.chapter.id}:${page.index}", page.stream)
++        }
+ 
+         if (!viewModel.hasValidArgs) {
+             finish()
+@@ -523,6 +533,7 @@ class ReaderActivity : BaseActivity() {
+      */
+     private fun setMenuVisibility(visible: Boolean) {
+         viewModel.showMenus(visible)
++        voiceBar?.visibility = if (visible) View.GONE else View.VISIBLE
+         if (visible) {
+             windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
+         } else if (readerPreferences.fullscreen.get()) {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/GeminiClient.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/GeminiClient.kt
+new file mode 100644
+index 0000000..9aae370
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/GeminiClient.kt
+@@ -0,0 +1,461 @@
++package eu.kanade.tachiyomi.ui.reader.voice
++
++import android.util.Base64
++import org.json.JSONArray
++import org.json.JSONObject
++import java.net.HttpURLConnection
++import java.net.URL
++
++/** Small in-memory log (last 300 lines) that the Log button shows live. */
++internal object VoiceLog {
++    private val lines = ArrayList<String>()
++    private val format = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
++
++    @Synchronized
++    fun add(message: String) {
++        lines.add(format.format(java.util.Date()) + "  " + message)
++        while (lines.size > 300) lines.removeAt(0)
++    }
++
++    @Synchronized
++    fun text(): String = if (lines.isEmpty()) "(nothing yet)" else lines.joinToString("\n")
++
++    @Synchronized
++    fun clear() = lines.clear()
++}
++
++/** One line found on a page: the text to speak, who says it, and whether it is a sound effect. */
++internal class RawLine(val text: String, val speaker: String, val sfx: Boolean)
++
++/** An error from Google's servers, with a message that can be shown to the reader. */
++internal class GeminiException(message: String, val code: Int = 0) : Exception(message)
++
++/**
++ * Minimal client for the Gemini REST API (no extra libraries).
++ * - [analyzePage] sends a manga page and gets back each line of text with who says it.
++ * - [synthesize] turns text into speech with one of Gemini's voices (raw 24 kHz 16-bit mono PCM).
++ */
++internal object GeminiClient {
++
++    const val DEFAULT_MODEL = "gemini-3.5-flash-lite"
++    const val DEFAULT_TTS_MODEL = "gemini-3.8-flash-lite-tts"
++    const val FULL_TTS_MODEL = "gemini-3.8-flash-tts"
++    const val SAMPLE_RATE = 24000
++
++    private const val BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
++
++    fun analyzePage(
++        apiKey: String,
++        model: String,
++        jpeg: ByteArray,
++        cast: String,
++        context: String,
++        direction: String = "auto",
++    ): List<RawLine> {
++        val prompt = buildPrompt(cast, context, direction)
++        val image = JSONObject()
++            .put("mime_type", "image/jpeg")
++            .put("data", Base64.encodeToString(jpeg, Base64.NO_WRAP))
++        val parts = JSONArray()
++            .put(JSONObject().put("text", prompt))
++            .put(JSONObject().put("inline_data", image))
++        val content = JSONObject().put("role", "user").put("parts", parts)
++
++        fun body(lowThinking: Boolean): JSONObject {
++            val config = JSONObject().put("responseMimeType", "application/json")
++            if (lowThinking) config.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
++            return JSONObject().put("contents", JSONArray().put(content)).put("generationConfig", config)
++        }
++
++        val url = "$BASE$model:generateContent"
++        val response = try {
++            post(url, apiKey, body(true), 120_000)
++        } catch (e: GeminiException) {
++            // Some models do not accept a thinking level; try once more without it.
++            if (e.code == 400) post(url, apiKey, body(false), 120_000) else throw e
++        }
++        return parseLines(response)
++    }
++
++    /** Asks Google which models this key can use and picks a good one (Flash, newest, stable first). */
++    fun pickModel(apiKey: String, tts: Boolean, exclude: String? = null): String? {
++        val connection = URL("${BASE.trimEnd('/')}?pageSize=200").openConnection() as HttpURLConnection
++        val names = ArrayList<String>()
++        try {
++            connection.connectTimeout = 20_000
++            connection.readTimeout = 30_000
++            connection.setRequestProperty("x-goog-api-key", apiKey)
++            if (connection.responseCode !in 200..299) return null
++            val json = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
++            val models = json.optJSONArray("models") ?: return null
++            for (i in 0 until models.length()) {
++                val model = models.optJSONObject(i) ?: continue
++                val methods = model.optJSONArray("supportedGenerationMethods") ?: continue
++                var ok = false
++                for (k in 0 until methods.length()) if (methods.optString(k) == "generateContent") ok = true
++                if (ok) names.add(model.optString("name").removePrefix("models/"))
++            }
++        } catch (e: Exception) {
++            return null
++        } finally {
++            connection.disconnect()
++        }
++        val skip = listOf("image", "live", "audio", "thinking", "exp", "8b", "embedding", "robotics", "computer")
++        val candidates = names.filter { name ->
++            if (name == exclude) {
++                false
++            } else if (tts) {
++                name.contains("tts") && name.contains("flash")
++            } else {
++                name.startsWith("gemini-") && name.contains("flash") && !name.contains("tts") &&
++                    skip.none { name.contains(it) }
++            }
++        }
++        fun version(name: String): Double =
++            Regex("gemini-([0-9]+(?:\\.[0-9]+)?)").find(name)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
++        return candidates.sortedWith(
++            compareByDescending<String> { if (it.contains("preview")) 0 else 1 }
++                .thenByDescending { version(it) }
++                .thenBy { if (it.contains("lite")) 0 else 1 },
++        ).firstOrNull()
++    }
++
++    private const val VOICES_URL = "https://generativelanguage.googleapis.com/v1beta/voices"
++    private const val INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
++
++    /** Makes a voice that sounds like the speaker in [sourceWav] (needs their spoken consent in [consentWav]). */
++    fun createVoice(apiKey: String, model: String, sourceWav: ByteArray, consentWav: ByteArray): String {
++        fun audio(bytes: ByteArray) = JSONObject()
++            .put("mime_type", "audio/wav")
++            .put("data", Base64.encodeToString(bytes, Base64.NO_WRAP))
++
++        val replicated = JSONObject()
++            .put("source_audio", audio(sourceWav))
++            .put("consent_audio", audio(consentWav))
++        val voice = JSONObject()
++            .put("model", model)
++            .put("type", "replicated")
++            .put("display_name", "My manga voice")
++            .put("replicated", replicated)
++        val body = JSONObject().put("store", true).put("voice", voice)
++        val response = post(VOICES_URL, apiKey, body, 180_000)
++        val made = response.optJSONObject("replicated_voice") ?: response.optJSONObject("replicatedVoice")
++        val id = made?.optString("id").orEmpty().ifEmpty { made?.optString("key").orEmpty() }
++        if (id.isEmpty()) throw GeminiException("Google did not send back a voice id")
++        return id
++    }
++
++    private fun findAudio(node: Any?): ByteArray? {
++        var found: ByteArray? = null
++        when (node) {
++            is JSONObject -> {
++                if (node.optString("type") == "audio" && node.optString("data").isNotEmpty()) {
++                    found = Base64.decode(node.optString("data"), Base64.DEFAULT)
++                }
++                val keys = node.keys()
++                while (keys.hasNext()) {
++                    findAudio(node.opt(keys.next()))?.let { found = it }
++                }
++            }
++            is JSONArray -> for (i in 0 until node.length()) findAudio(node.opt(i))?.let { found = it }
++        }
++        return found
++    }
++
++    /** Speech with a cloned voice (voice_... id). Returns raw 24 kHz 16-bit mono PCM. */
++    fun synthesizeCustom(apiKey: String, model: String, voiceId: String, text: String): ByteArray {
++        val content = JSONObject().put("type", "text").put("text", text)
++        val input = JSONObject().put("type", "user_input").put("content", JSONArray().put(content))
++        val body = JSONObject()
++            .put("model", model)
++            .put("input", JSONArray().put(input))
++            .put("response_format", JSONObject().put("type", "audio"))
++            .put(
++                "generation_config",
++                JSONObject().put("speech_config", JSONArray().put(JSONObject().put("voice", voiceId))),
++            )
++        val response = post(INTERACTIONS_URL, apiKey, body, 120_000)
++        var bytes = findAudio(response) ?: throw GeminiException("Gemini sent no audio")
++        // The default answer is a WAV file; drop its header to get raw samples.
++        if (bytes.size > 44 && bytes[0] == 'R'.code.toByte() && bytes[1] == 'I'.code.toByte()) {
++            var offset = 12
++            var start = 44
++            while (offset + 8 <= bytes.size) {
++                val name = String(bytes, offset, 4, Charsets.ISO_8859_1)
++                val size = (bytes[offset + 4].toInt() and 0xFF) or ((bytes[offset + 5].toInt() and 0xFF) shl 8) or
++                    ((bytes[offset + 6].toInt() and 0xFF) shl 16) or ((bytes[offset + 7].toInt() and 0xFF) shl 24)
++                if (name == "data") {
++                    start = offset + 8
++                    break
++                }
++                offset += 8 + size
++            }
++            bytes = bytes.copyOfRange(minOf(start, bytes.size), bytes.size)
++        }
++        return bytes
++    }
++
++    /** One or two (label, voiceName) pairs. Two voices use Gemini's multi-speaker mode. */
++    private fun speechBody(voices: List<Pair<String, String>>, text: String): JSONObject {
++        fun voiceConfig(name: String) =
++            JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", name))
++
++        val speech = JSONObject()
++        if (voices.size >= 2) {
++            val configs = JSONArray()
++            for ((label, name) in voices.take(2)) {
++                configs.put(JSONObject().put("speaker", label).put("voiceConfig", voiceConfig(name)))
++            }
++            speech.put("multiSpeakerVoiceConfig", JSONObject().put("speakerVoiceConfigs", configs))
++        } else {
++            speech.put("voiceConfig", voiceConfig(voices.first().second))
++        }
++        val config = JSONObject()
++            .put("responseModalities", JSONArray().put("AUDIO"))
++            .put("speechConfig", speech)
++        return JSONObject()
++            .put(
++                "contents",
++                JSONArray().put(
++                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", text))),
++                ),
++            )
++            .put("generationConfig", config)
++    }
++
++    private fun audioOf(response: JSONObject): List<ByteArray> {
++        val result = ArrayList<ByteArray>()
++        val parts = response.optJSONArray("candidates")
++            ?.optJSONObject(0)
++            ?.optJSONObject("content")
++            ?.optJSONArray("parts")
++            ?: return result
++        for (i in 0 until parts.length()) {
++            val part = parts.optJSONObject(i) ?: continue
++            val inline = part.optJSONObject("inlineData") ?: part.optJSONObject("inline_data")
++            val data = inline?.optString("data", "") ?: ""
++            if (data.isNotEmpty()) result.add(Base64.decode(data, Base64.DEFAULT))
++        }
++        return result
++    }
++
++    /** Whole answer at once (used if streaming is not accepted). */
++    fun synthesize(apiKey: String, model: String, voices: List<Pair<String, String>>, text: String): ByteArray {
++        val response = post("$BASE$model:generateContent", apiKey, speechBody(voices, text), 90_000)
++        val chunks = audioOf(response)
++        if (chunks.isEmpty()) throw GeminiException("Gemini sent no audio")
++        val out = java.io.ByteArrayOutputStream()
++        for (chunk in chunks) out.write(chunk)
++        return out.toByteArray()
++    }
++
++    /**
++     * Streams the speech: [onChunk] gets raw PCM pieces as soon as Google makes them
++     * and returns false to cancel. Returns how many bytes arrived.
++     */
++    fun synthesizeStream(
++        apiKey: String,
++        model: String,
++        voices: List<Pair<String, String>>,
++        text: String,
++        onChunk: (ByteArray) -> Boolean,
++    ): Int {
++        val label = "$model (stream)"
++        return retrying(label) { streamOnce(apiKey, model, voices, text, onChunk, label) }
++    }
++
++    private fun streamOnce(
++        apiKey: String,
++        model: String,
++        voices: List<Pair<String, String>>,
++        text: String,
++        onChunk: (ByteArray) -> Boolean,
++        label: String,
++    ): Int {
++        val started = System.currentTimeMillis()
++        VoiceLog.add("-> $label")
++        val connection = URL("$BASE$model:streamGenerateContent?alt=sse").openConnection() as HttpURLConnection
++        var total = 0
++        try {
++            connection.requestMethod = "POST"
++            connection.connectTimeout = 20_000
++            connection.readTimeout = 90_000
++            connection.doOutput = true
++            connection.setRequestProperty("Content-Type", "application/json")
++            connection.setRequestProperty("x-goog-api-key", apiKey)
++            connection.outputStream.use {
++                it.write(speechBody(voices, text).toString().toByteArray(Charsets.UTF_8))
++            }
++            val code = connection.responseCode
++            if (code !in 200..299) {
++                val error = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
++                VoiceLog.add("<- $label HTTP $code: ${error.replace("\n", " ").take(220)}")
++                throw GeminiException(friendly(error, code), code)
++            }
++            connection.inputStream.bufferedReader().use { reader ->
++                while (true) {
++                    val line = reader.readLine() ?: break
++                    if (!line.startsWith("data:")) continue
++                    val json = line.substring(5).trim()
++                    if (json.isEmpty()) continue
++                    for (chunk in audioOf(JSONObject(json))) {
++                        if (total == 0) VoiceLog.add("<- $label first audio after ${System.currentTimeMillis() - started}ms")
++                        total += chunk.size
++                        if (!onChunk(chunk)) return total
++                    }
++                }
++            }
++        } finally {
++            connection.disconnect()
++        }
++        VoiceLog.add("<- $label done, $total bytes in ${System.currentTimeMillis() - started}ms")
++        return total
++    }
++
++    private fun buildPrompt(cast: String, context: String, direction: String): String {
++        val characters = cast.trim().ifEmpty { "not provided" }
++        val builder = StringBuilder()
++        builder.append("You are helping a text-to-speech reader for an English manga or comic page. ")
++        builder.append("List every line of dialogue, thought and narration on this page in the correct reading order.\n")
++        when (direction) {
++            "rtl" -> builder.append(
++                "READING ORDER (this is right-to-left manga): go through the panel rows from top to bottom. " +
++                    "Inside each row read the panels from the RIGHT to the LEFT. " +
++                    "Inside one panel read the bubbles from the top-right to the bottom-left.\n",
++            )
++            "ltr" -> builder.append(
++                "READING ORDER (this is left-to-right comic): go through the panel rows from top to bottom. " +
++                    "Inside each row read the panels from the LEFT to the RIGHT. " +
++                    "Inside one panel read the bubbles from the top-left to the bottom-right.\n",
++            )
++            else -> builder.append(
++                "READING ORDER: decide from the page layout whether it is right-to-left manga or left-to-right comic " +
++                    "(manga is right to left). Then go through the panel rows from top to bottom, " +
++                    "and read the panels in each row in that direction.\n",
++            )
++        }
++        builder.append("Follow that order strictly; never jump to the bubble that seems most important.\n")
++        builder.append("For each line give the text as printed, but write it as a normal sentence, not in ALL CAPS, ")
++        builder.append("and say who speaks it: \"girl\" (a female character), \"boy\" (a male character), ")
++        builder.append("\"narrator\" (narration boxes and captions), or \"unsure\" if you cannot tell. ")
++        builder.append("Use these clues: which character the bubble tail points to, who is in the panel, ")
++        builder.append("names used when someone is addressed (the person addressed is usually not the speaker), ")
++        builder.append("and how the conversation alternates between characters.\n")
++        builder.append("Also include handwritten sound effects and exclamations (like Shf, Eesh, Gulp, Hmph) ")
++        builder.append("as their own lines with \"sfx\": true. Write each one as a short word that a voice can say ")
++        builder.append("naturally (for example \"shuff\", \"eesh\"), and use speaker \"narrator\". ")
++        builder.append("Skip pure background signs and decorative marks. ")
++        builder.append("Do not invent text that is not on the page.\n")
++        builder.append("Characters: ").append(characters).append("\n")
++        if (context.isNotBlank()) {
++            builder.append("The last lines from the previous page, for context only (do not repeat them):\n")
++            builder.append(context).append("\n")
++        }
++        builder.append("Reply with ONLY JSON in exactly this form: ")
++        builder.append("{\"lines\":[{\"text\":\"...\",\"speaker\":\"girl|boy|narrator|unsure\",\"sfx\":false}]}")
++        return builder.toString()
++    }
++
++    private fun parseLines(response: JSONObject): List<RawLine> {
++        val parts = response.optJSONArray("candidates")
++            ?.optJSONObject(0)
++            ?.optJSONObject("content")
++            ?.optJSONArray("parts")
++            ?: throw GeminiException("Gemini sent no answer for this page. Try again")
++
++        val raw = StringBuilder()
++        for (i in 0 until parts.length()) {
++            val part = parts.optJSONObject(i) ?: continue
++            if (!part.optBoolean("thought", false)) raw.append(part.optString("text", ""))
++        }
++        var text = raw.toString().trim()
++        if (text.startsWith("```")) {
++            text = text.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
++        }
++        val array = if (text.startsWith("[")) {
++            JSONArray(text)
++        } else {
++            JSONObject(text).optJSONArray("lines") ?: JSONArray()
++        }
++
++        val lines = ArrayList<RawLine>()
++        for (i in 0 until array.length()) {
++            val item = array.optJSONObject(i) ?: continue
++            val lineText = item.optString("text", "").trim()
++            if (lineText.isNotEmpty()) {
++                lines.add(
++                    RawLine(
++                        lineText,
++                        item.optString("speaker", "unsure").trim().lowercase(),
++                        item.optBoolean("sfx", false),
++                    ),
++                )
++            }
++        }
++        return lines
++    }
++
++    /** Tries again (after 1.5 s, then 3 s) when Google says it is busy (5xx). */
++    private fun <T> retrying(label: String, block: () -> T): T {
++        var attempt = 0
++        while (true) {
++            try {
++                return block()
++            } catch (e: GeminiException) {
++                val busy = e.code == 500 || e.code == 502 || e.code == 503 || e.code == 504
++                if (!busy || attempt >= 2) throw e
++                attempt++
++                VoiceLog.add("$label: Google busy (${e.code}), retry $attempt/2")
++                Thread.sleep(if (attempt == 1) 1500L else 3000L)
++            }
++        }
++    }
++
++    private fun post(url: String, apiKey: String, body: JSONObject, readTimeoutMs: Int): JSONObject {
++        val label = url.substringAfter("models/").substringBefore('?')
++        return retrying(label) { postOnce(url, apiKey, body, readTimeoutMs, label) }
++    }
++
++    private fun postOnce(url: String, apiKey: String, body: JSONObject, readTimeoutMs: Int, label: String): JSONObject {
++        val started = System.currentTimeMillis()
++        VoiceLog.add("-> $label")
++        val connection = URL(url).openConnection() as HttpURLConnection
++        try {
++            connection.requestMethod = "POST"
++            connection.connectTimeout = 20_000
++            connection.readTimeout = readTimeoutMs
++            connection.doOutput = true
++            connection.setRequestProperty("Content-Type", "application/json")
++            connection.setRequestProperty("x-goog-api-key", apiKey)
++            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
++
++            val code = connection.responseCode
++            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
++            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
++            val ms = System.currentTimeMillis() - started
++            if (code !in 200..299) {
++                VoiceLog.add("<- $label HTTP $code in ${ms}ms: ${text.replace("\n", " ").take(220)}")
++                throw GeminiException(friendly(text, code), code)
++            }
++            VoiceLog.add("<- $label OK in ${ms}ms")
++            return JSONObject(text)
++        } finally {
++            connection.disconnect()
++        }
++    }
++
++    private fun friendly(text: String, code: Int): String {
++        val detail = try {
++            JSONObject(text).optJSONObject("error")?.optString("message")
++        } catch (e: Exception) {
++            null
++        }
++        return when (code) {
++            429 -> "Free limit reached (voice is about 10 a minute, 100 a day). Wait a bit and try again"
++            401, 403 -> "Google rejected the key. Check it in settings"
++            404 -> "Model name not found. Check it in settings"
++            400 -> detail?.takeIf { it.isNotBlank() } ?: "Google could not accept the request"
++            else -> "Google error $code" + (detail?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: "")
++        }
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceClone.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceClone.kt
+new file mode 100644
+index 0000000..d2a5fb2
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceClone.kt
+@@ -0,0 +1,142 @@
++package eu.kanade.tachiyomi.ui.reader.voice
++
++import android.content.Context
++import android.media.MediaCodec
++import android.media.MediaExtractor
++import android.media.MediaFormat
++import android.net.Uri
++import java.io.ByteArrayOutputStream
++
++/** Turns any audio file the user picks into the 24 kHz mono 16-bit WAV that Google asks for. */
++internal object VoiceClone {
++    private const val RATE = 24000
++
++    fun toWav(context: Context, uri: Uri, maxSeconds: Int, minSeconds: Int): ByteArray {
++        val extractor = MediaExtractor()
++        try {
++            extractor.setDataSource(context, uri, null)
++            var track = -1
++            var format: MediaFormat? = null
++            for (i in 0 until extractor.trackCount) {
++                val candidate = extractor.getTrackFormat(i)
++                if (candidate.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
++                    track = i
++                    format = candidate
++                    break
++                }
++            }
++            if (track < 0 || format == null) throw IllegalArgumentException("No sound found in that file")
++            extractor.selectTrack(track)
++            val mime = format.getString(MediaFormat.KEY_MIME) ?: throw IllegalArgumentException("Unknown audio type")
++            var rate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
++            var channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
++            val pcm = ByteArrayOutputStream()
++            val limit = (maxSeconds + 1).toLong() * rate * channels * 2
++
++            val codec = MediaCodec.createDecoderByType(mime)
++            try {
++                codec.configure(format, null, null, 0)
++                codec.start()
++                val info = MediaCodec.BufferInfo()
++                var inputDone = false
++                var outputDone = false
++                while (!outputDone && pcm.size() < limit) {
++                    if (!inputDone) {
++                        val index = codec.dequeueInputBuffer(10_000)
++                        if (index >= 0) {
++                            val buffer = codec.getInputBuffer(index)!!
++                            val size = extractor.readSampleData(buffer, 0)
++                            if (size < 0) {
++                                codec.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
++                                inputDone = true
++                            } else {
++                                codec.queueInputBuffer(index, 0, size, extractor.sampleTime, 0)
++                                extractor.advance()
++                            }
++                        }
++                    }
++                    val out = codec.dequeueOutputBuffer(info, 10_000)
++                    if (out >= 0) {
++                        val buffer = codec.getOutputBuffer(out)!!
++                        val bytes = ByteArray(info.size)
++                        buffer.position(info.offset)
++                        buffer.limit(info.offset + info.size)
++                        buffer.get(bytes)
++                        pcm.write(bytes)
++                        codec.releaseOutputBuffer(out, false)
++                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
++                    } else if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
++                        val changed = codec.outputFormat
++                        rate = changed.getInteger(MediaFormat.KEY_SAMPLE_RATE)
++                        channels = changed.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
++                    }
++                }
++            } finally {
++                try {
++                    codec.stop()
++                } catch (e: Throwable) {
++                    // ignore
++                }
++                codec.release()
++            }
++
++            val data = pcm.toByteArray()
++            val frames = data.size / 2 / channels
++            if (frames <= 0) throw IllegalArgumentException("Could not read the sound in that file")
++            val mono = FloatArray(frames)
++            for (f in 0 until frames) {
++                var sum = 0f
++                for (c in 0 until channels) {
++                    val i = (f * channels + c) * 2
++                    sum += ((data[i].toInt() and 0xFF) or (data[i + 1].toInt() shl 8)).toFloat()
++                }
++                mono[f] = sum / channels
++            }
++            val outLength = minOf((frames.toLong() * RATE / rate).toInt(), RATE * maxSeconds)
++            if (outLength < RATE * minSeconds) {
++                throw IllegalArgumentException("That recording is too short (it needs at least $minSeconds seconds)")
++            }
++            val wav = ByteArrayOutputStream(44 + outLength * 2)
++            writeHeader(wav, outLength * 2)
++            for (i in 0 until outLength) {
++                val pos = i.toDouble() * rate / RATE
++                val i0 = minOf(pos.toInt(), frames - 1)
++                val i1 = minOf(i0 + 1, frames - 1)
++                val value = mono[i0] + (mono[i1] - mono[i0]) * (pos - i0).toFloat()
++                val sample = value.toInt().coerceIn(-32768, 32767)
++                wav.write(sample and 0xFF)
++                wav.write((sample shr 8) and 0xFF)
++            }
++            return wav.toByteArray()
++        } finally {
++            extractor.release()
++        }
++    }
++
++    private fun writeHeader(out: ByteArrayOutputStream, dataBytes: Int) {
++        fun int(v: Int) {
++            out.write(v and 0xFF)
++            out.write((v shr 8) and 0xFF)
++            out.write((v shr 16) and 0xFF)
++            out.write((v shr 24) and 0xFF)
++        }
++
++        fun short(v: Int) {
++            out.write(v and 0xFF)
++            out.write((v shr 8) and 0xFF)
++        }
++        out.write("RIFF".toByteArray())
++        int(36 + dataBytes)
++        out.write("WAVE".toByteArray())
++        out.write("fmt ".toByteArray())
++        int(16)
++        short(1)
++        short(1)
++        int(RATE)
++        int(RATE * 2)
++        short(2)
++        short(16)
++        out.write("data".toByteArray())
++        int(dataBytes)
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt
+new file mode 100644
+index 0000000..4ccb476
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/voice/VoiceReader.kt
+@@ -0,0 +1,1941 @@
++package eu.kanade.tachiyomi.ui.reader.voice
++
++import android.app.Activity
++import android.app.AlertDialog
++import android.content.Context
++import android.content.Intent
++import android.content.SharedPreferences
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.graphics.Color
++import android.graphics.Rect
++import android.graphics.Typeface
++import android.graphics.drawable.GradientDrawable
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioTrack
++import android.net.Uri
++import android.os.Handler
++import android.os.Looper
++import android.provider.MediaStore
++import android.speech.tts.TextToSpeech
++import android.speech.tts.UtteranceProgressListener
++import android.speech.tts.Voice
++import android.text.InputType
++import android.text.TextUtils
++import android.util.TypedValue
++import android.view.Gravity
++import android.view.PixelCopy
++import android.view.View
++import android.view.ViewGroup
++import android.widget.Button
++import android.widget.CheckBox
++import android.widget.EditText
++import android.widget.FrameLayout
++import android.widget.LinearLayout
++import android.widget.ScrollView
++import android.widget.TextView
++import android.widget.Toast
++import androidx.activity.ComponentActivity
++import androidx.activity.result.ActivityResultLauncher
++import androidx.activity.result.contract.ActivityResultContracts
++import java.io.ByteArrayOutputStream
++import java.io.IOException
++import java.io.InputStream
++import java.util.Collections
++import java.util.Locale
++import java.util.concurrent.Executors
++import kotlin.math.PI
++import kotlin.math.abs
++import kotlin.math.exp
++import kotlin.math.sin
++
++/** The page currently shown in the reader: a key for caching and a way to open the original image. */
++class VoicePage(val key: String, val stream: (() -> InputStream)?)
++
++/**
++ * Voice mode for the reader. Adds a small bar at the bottom of the screen:
++ * - Listen: sends the current page to Gemini, which returns each line of text and who says it
++ *   (girl, boy, narrator or unsure). Each line is then read in the matching voice.
++ *   Hold Listen to see the lines and fix who speaks any of them.
++ * - Stop: stops speaking (or cancels reading the page).
++ * - Settings: your free Google key, models, voices and a short cast description.
++ *
++ * Returns the bar so the reader can hide it while its own menus are showing.
++ */
++fun addVoiceListenButton(
++    activity: Activity,
++    root: ViewGroup,
++    source: View,
++    currentPage: (Int) -> VoicePage?,
++): View {
++    return VoiceUi(activity, root, source, currentPage).install()
++}
++
++private enum class Speaker(
++    val label: String,
++    val emoji: String,
++    val color: Int,
++    val pitch: Float,
++    val rate: Float,
++) {
++    GIRL("Girl", "👧", 0xFFE91E8C.toInt(), 1.25f, 1.0f),
++    BOY("Boy", "👦", 0xFF1E88E5.toInt(), 0.8f, 1.0f),
++    NARRATOR("Narrator", "🎙", 0xFF43A047.toInt(), 1.0f, 0.95f),
++    CUSTOM("Custom", "⭐", 0xFFFB8C00.toInt(), 0.9f, 1.05f),
++    SKIP("Skip", "⏭", 0xFF757575.toInt(), 1.0f, 1.0f),
++    UNSURE("?", "❓", 0xFFFFC107.toInt(), 1.0f, 0.95f),
++    ;
++
++    fun next(): Speaker = when (this) {
++        UNSURE -> GIRL
++        GIRL -> BOY
++        BOY -> NARRATOR
++        NARRATOR -> CUSTOM
++        CUSTOM -> SKIP
++        SKIP -> GIRL
++    }
++}
++
++private class Line(val text: String, var speaker: Speaker, val sfx: Boolean = false)
++
++private val SPEED_LABELS = listOf("Slow" to 0.8f, "Normal" to 1.0f, "Fast" to 1.25f, "Faster" to 1.5f)
++
++private val DEFAULT_VOICES = mapOf(
++    "voice_girl" to "Kore",
++    "voice_boy" to "Puck",
++    "voice_narrator" to "Charon",
++    "voice_custom" to "",
++)
++
++private fun toast(activity: Activity, message: String) {
++    Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
++}
++
++private fun speakerFromWord(word: String): Speaker = when (word) {
++    "girl", "female", "woman" -> Speaker.GIRL
++    "boy", "male", "man" -> Speaker.BOY
++    "narrator", "narration", "caption" -> Speaker.NARRATOR
++    else -> Speaker.UNSURE
++}
++
++private fun roundedBackground(fill: Int, radiusPx: Int, strokeColor: Int = 0, strokePx: Int = 0): GradientDrawable {
++    return GradientDrawable().apply {
++        cornerRadius = radiusPx.toFloat()
++        setColor(fill)
++        if (strokePx > 0) setStroke(strokePx, strokeColor)
++    }
++}
++
++/** Opens the original page image and returns it as a JPEG (at most ~2600 px). Null for very tall strips. */
++private fun decodeOriginal(provider: () -> InputStream): ByteArray? {
++    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++    provider().use { BitmapFactory.decodeStream(it, null, bounds) }
++    val w = bounds.outWidth
++    val h = bounds.outHeight
++    if (w <= 0 || h <= 0 || h > 2.5f * w) return null
++    var sample = 1
++    while (maxOf(w, h) / sample > 2600) sample *= 2
++    val options = BitmapFactory.Options().apply { inSampleSize = sample }
++    val bitmap = provider().use { BitmapFactory.decodeStream(it, null, options) } ?: return null
++    val out = ByteArrayOutputStream()
++    bitmap.compress(Bitmap.CompressFormat.JPEG, 88, out)
++    bitmap.recycle()
++    return out.toByteArray()
++}
++
++private class VoiceUi(
++    private val activity: Activity,
++    private val root: ViewGroup,
++    private val source: View,
++    private val currentPage: (Int) -> VoicePage?,
++) {
++    private val density = activity.resources.displayMetrics.density
++    private val prefs: SharedPreferences = activity.getSharedPreferences("voice_listen", Context.MODE_PRIVATE)
++    private val main = Handler(Looper.getMainLooper())
++    private val io = Executors.newSingleThreadExecutor()
++    private val batchPool = Executors.newFixedThreadPool(4)
++    private val player = LinePlayer(activity, prefs) { updateBar() }
++    private val cache = object : LinkedHashMap<String, List<Line>>(16, 0.75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<Line>>?): Boolean = size > 40
++    }
++
++    private var lastLines: List<Line> = emptyList()
++    private var busy = false
++    private var requestId = 0
++
++    private lateinit var bar: LinearLayout
++    private lateinit var listenButton: TextView
++    private lateinit var stopButton: TextView
++
++    private fun dp(value: Int) = (value * density).toInt()
++
++    private fun pill(label: String, color: Int): TextView = TextView(activity).apply {
++        text = label
++        gravity = Gravity.CENTER
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
++        typeface = Typeface.DEFAULT_BOLD
++        setPadding(dp(18), dp(10), dp(18), dp(10))
++        background = roundedBackground(color, dp(30))
++    }
++
++    fun install(): View {
++        bar = LinearLayout(activity).apply {
++            orientation = LinearLayout.HORIZONTAL
++            gravity = Gravity.CENTER_VERTICAL
++            setPadding(dp(6), dp(6), dp(6), dp(6))
++            background = roundedBackground(0xE6202124.toInt(), dp(40), 0x55FFFFFF, dp(1))
++            elevation = dp(8).toFloat()
++        }
++        listenButton = pill("🔊 Listen", 0xFF3949AB.toInt()).apply {
++            setOnClickListener { onListenTap() }
++            setOnLongClickListener {
++                read(openEditor = true)
++                true
++            }
++        }
++        stopButton = pill("■ Stop", 0xFFD32F2F.toInt()).apply {
++            visibility = View.GONE
++            setOnClickListener { onStopTap() }
++        }
++        val settingsButton = pill("⚙", 0xFF424242.toInt()).apply {
++            setOnClickListener { showSettings(activity, prefs, player) }
++        }
++        val logButton = pill("📋", 0xFF424242.toInt()).apply {
++            setOnClickListener { showLog(activity) }
++        }
++        val gap = dp(3)
++        for (button in listOf(listenButton, stopButton, settingsButton, logButton)) {
++            bar.addView(
++                button,
++                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++                    .apply { setMargins(gap, 0, gap, 0) },
++            )
++        }
++        root.addView(
++            bar,
++            FrameLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT,
++                ViewGroup.LayoutParams.WRAP_CONTENT,
++                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
++            ).apply { setMargins(0, 0, 0, dp(52)) },
++        )
++        root.addOnAttachStateChangeListener(
++            object : View.OnAttachStateChangeListener {
++                override fun onViewAttachedToWindow(v: View) {}
++
++                override fun onViewDetachedFromWindow(v: View) {
++                    requestId++
++                    main.removeCallbacksAndMessages(null)
++                    io.shutdownNow()
++                    batchPool.shutdownNow()
++                    player.shutdown()
++                }
++            },
++        )
++        return bar
++    }
++
++    private fun updateBar() {
++        listenButton.text = if (busy) "Reading page..." else "🔊 Listen"
++        stopButton.visibility = if (busy || player.isPlaying) View.VISIBLE else View.GONE
++    }
++
++    private fun onListenTap() {
++        if (player.isPlaying) {
++            player.stop()
++        } else if (!busy) {
++            read(openEditor = false)
++        }
++    }
++
++    private fun onStopTap() {
++        if (player.isPlaying) player.stop()
++        if (busy) {
++            requestId++
++            busy = false
++            updateBar()
++        }
++    }
++
++    // ---- reading a page ------------------------------------------------------------------
++
++    private fun read(openEditor: Boolean) {
++        if (busy) return
++        val apiKey = prefs.getString("api_key", "")?.trim().orEmpty()
++        if (apiKey.isEmpty()) {
++            toast(activity, "Paste your free Google key first")
++            showSettings(activity, prefs, player)
++            return
++        }
++        val page = currentPage(0)
++        if (!openEditor && page != null && player.playStored(page.key)) return
++        val batch = prefs.getInt("batch_pages", 3).let { if (it <= 0) 3 else it.coerceAtMost(10) }
++        if (!openEditor && page != null && batch != 1 && prefs.getBoolean("gemini_voice_on", false)) {
++            readBatch(apiKey, batch)
++            return
++        }
++        val cached = page?.let { synchronized(cache) { cache[it.key] } }
++        if (cached != null) {
++            deliver(cached, openEditor)
++            return
++        }
++        readSingle(page, apiKey, openEditor)
++    }
++
++    private fun messageFor(e: Exception): String = when (e) {
++        is GeminiException -> e.message ?: "Gemini error"
++        is IOException -> "Could not reach Google. Check your internet"
++        else -> "Could not understand Gemini's answer. Try again"
++    }
++
++    /** Sends one page image to Gemini; if the model is busy or missing, tries another one. */
++    private fun analyzeWithFallback(
++        apiKey: String,
++        model: String,
++        jpeg: ByteArray,
++        cast: String,
++        context: String,
++        key: String?,
++    ): List<RawLine> {
++        val direction = prefs.getString("direction", "auto").orEmpty()
++        VoiceLog.add("page $key: sending ${jpeg.size / 1024} KB to $model")
++        val result = try {
++            GeminiClient.analyzePage(apiKey, model, jpeg, cast, context, direction)
++        } catch (e: GeminiException) {
++            val retryable = e.code == 404 || e.code == 503 || e.code == 429
++            val alt = if (retryable) GeminiClient.pickModel(apiKey, false, model) else null
++            if (alt == null) throw e
++            if (e.code == 404) prefs.edit().putString("model", alt).apply()
++            VoiceLog.add("reading: $model failed (${e.code}), trying $alt")
++            main.post { toast(activity, "$model is busy or missing. Trying $alt") }
++            GeminiClient.analyzePage(apiKey, alt, jpeg, cast, context, direction)
++        }
++        VoiceLog.add("page $key read: ${result.size} lines")
++        return result
++    }
++
++    private fun readModel(): String =
++        prefs.getString("model", GeminiClient.DEFAULT_MODEL)?.trim().orEmpty().ifEmpty { GeminiClient.DEFAULT_MODEL }
++
++    private fun contextLines(): String =
++        lastLines.takeLast(6).joinToString("\n") { "${it.speaker.name.lowercase()}: ${it.text}" }
++
++    private fun readSingle(page: VoicePage?, apiKey: String, openEditor: Boolean) {
++        busy = true
++        player.stop()
++        val token = ++requestId
++        updateBar()
++        capture(page) { jpeg ->
++            if (token != requestId) {
++                // cancelled
++            } else if (jpeg == null) {
++                fail("Could not capture the page")
++            } else {
++                val model = readModel()
++                val cast = prefs.getString("cast", "").orEmpty()
++                val context = contextLines()
++                io.execute {
++                    try {
++                        val result = analyzeWithFallback(apiKey, model, jpeg, cast, context, page?.key)
++                        main.post { if (token == requestId) analyzed(result, page?.key, openEditor) }
++                    } catch (e: Exception) {
++                        VoiceLog.add("reading failed: ${e.javaClass.simpleName}: ${e.message}")
++                        main.post { if (token == requestId) fail(messageFor(e)) }
++                    }
++                }
++            }
++        }
++    }
++
++    /** Reads this page and the next ones at the same time, then voices them in ONE request. */
++    private fun readBatch(apiKey: String, count: Int) {
++        busy = true
++        player.stop()
++        val token = ++requestId
++        updateBar()
++        val model = readModel()
++        val cast = prefs.getString("cast", "").orEmpty()
++        val context = contextLines()
++        val pages = (0 until count).map { currentPage(it) }.takeWhile { it != null }.filterNotNull()
++        if (pages.isEmpty()) {
++            fail("Could not find the page")
++            return
++        }
++        io.execute {
++            try {
++                fun analyzeOne(page: VoicePage, primary: Boolean): List<Line>? {
++                    synchronized(cache) { cache[page.key] }?.let { return it }
++                    val jpeg = try {
++                        page.stream?.let { decodeOriginal(it) }
++                    } catch (e: Throwable) {
++                        null
++                    } ?: return null
++                    return try {
++                        val result = analyzeWithFallback(apiKey, model, jpeg, cast, context, page.key)
++                        val lines = result.map { Line(it.text, speakerFromWord(it.speaker), it.sfx) }.toMutableList()
++                        if (lines.isNotEmpty()) synchronized(cache) { cache[page.key] = lines }
++                        lines
++                    } catch (e: Exception) {
++                        if (primary) throw e
++                        VoiceLog.add("page ${page.key} skipped: ${e.message}")
++                        null
++                    }
++                }
++
++                val tasks = pages.mapIndexed { i, page ->
++                    batchPool.submit<List<Line>?> { analyzeOne(page, i == 0) }
++                }
++                val results = ArrayList<List<Line>?>()
++                for ((i, task) in tasks.withIndex()) {
++                    try {
++                        results.add(task.get())
++                    } catch (e: java.util.concurrent.ExecutionException) {
++                        if (i == 0) throw (e.cause as? Exception ?: e)
++                        results.add(null)
++                    }
++                }
++                val firstLines = results[0]
++                if (firstLines == null) {
++                    // Not a normal page image (for example a tall strip): use the screenshot way.
++                    main.post {
++                        if (token == requestId) {
++                            busy = false
++                            readSingle(pages[0], apiKey, false)
++                        }
++                    }
++                } else {
++                    val readSfx = prefs.getBoolean("read_sfx", true)
++                    val items = ArrayList<Pair<String, List<Line>>>()
++                    for ((i, r) in results.withIndex()) {
++                        val keep = r?.filter { readSfx || !it.sfx }.orEmpty()
++                        if (keep.isNotEmpty()) items.add(pages[i].key to keep)
++                    }
++                    main.post {
++                        if (token == requestId) {
++                            busy = false
++                            if (firstLines.isNotEmpty()) lastLines = firstLines
++                            updateBar()
++                            if (activity.isFinishing || activity.isDestroyed) {
++                                // nothing to do
++                            } else if (items.isEmpty()) {
++                                toast(activity, "No text found on these pages")
++                            } else {
++                                if (!prefs.getBoolean("tip_shown", false)) {
++                                    prefs.edit().putBoolean("tip_shown", true).apply()
++                                    toast(activity, "Tip: it plays this page now. Turn the page and it plays the next one")
++                                }
++                                player.playPages(items) { currentPage(0)?.key }
++                            }
++                        }
++                    }
++                }
++            } catch (e: Exception) {
++                VoiceLog.add("reading failed: ${e.javaClass.simpleName}: ${e.message}")
++                main.post { if (token == requestId) fail(messageFor(e)) }
++            }
++        }
++    }
++
++    private fun analyzed(result: List<RawLine>, key: String?, openEditor: Boolean) {
++        busy = false
++        val lines = result.map { Line(it.text, speakerFromWord(it.speaker), it.sfx) }.toMutableList()
++        if (lines.isNotEmpty()) {
++            lastLines = lines
++            if (key != null) synchronized(cache) { cache[key] = lines }
++        }
++        updateBar()
++        deliver(lines, openEditor)
++    }
++
++    private fun fail(message: String) {
++        busy = false
++        updateBar()
++        toast(activity, message)
++    }
++
++    private fun deliver(lines: List<Line>, openEditor: Boolean) {
++        if (activity.isFinishing || activity.isDestroyed) return
++        if (lines.isEmpty()) {
++            toast(activity, "No text found on this page")
++        } else if (openEditor) {
++            LinesDialog(activity, prefs, player, (lines as? MutableList<Line>) ?: lines.toMutableList()).show()
++        } else {
++            val readSfx = prefs.getBoolean("read_sfx", true)
++            val playable = if (readSfx) lines else lines.filterNot { it.sfx }
++            val unsure = playable.count { it.speaker == Speaker.UNSURE }
++            if (!prefs.getBoolean("tip_shown", false)) {
++                prefs.edit().putBoolean("tip_shown", true).apply()
++                toast(activity, "Tip: hold Listen to fix who speaks a line")
++            } else if (unsure > 0) {
++                toast(activity, "$unsure line(s) unsure. Hold Listen to fix them")
++            }
++            if (playable.isEmpty()) toast(activity, "No text found on this page") else player.play(playable)
++        }
++    }
++
++    /** The page image as a JPEG: the original file when possible, otherwise a screenshot. */
++    private fun capture(page: VoicePage?, onResult: (ByteArray?) -> Unit) {
++        val provider = page?.stream
++        io.execute {
++            val original = if (provider != null) {
++                try {
++                    decodeOriginal(provider)
++                } catch (e: Throwable) {
++                    null
++                }
++            } else {
++                null
++            }
++            main.post {
++                if (original != null) onResult(original) else screenshot(onResult)
++            }
++        }
++    }
++
++    private fun screenshot(onResult: (ByteArray?) -> Unit) {
++        if (source.width <= 0 || source.height <= 0) {
++            onResult(null)
++            return
++        }
++        val location = IntArray(2)
++        source.getLocationInWindow(location)
++        val area = Rect(location[0], location[1], location[0] + source.width, location[1] + source.height)
++        val previous = bar.visibility
++        bar.visibility = View.INVISIBLE
++        main.postDelayed(
++            {
++                val bitmap = try {
++                    Bitmap.createBitmap(area.width(), area.height(), Bitmap.Config.ARGB_8888)
++                } catch (e: Throwable) {
++                    null
++                }
++                if (bitmap == null) {
++                    bar.visibility = previous
++                    onResult(null)
++                } else {
++                    try {
++                        PixelCopy.request(
++                            activity.window,
++                            area,
++                            bitmap,
++                            { result ->
++                                bar.visibility = previous
++                                if (result == PixelCopy.SUCCESS) {
++                                    val out = ByteArrayOutputStream()
++                                    bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
++                                    onResult(out.toByteArray())
++                                } else {
++                                    onResult(null)
++                                }
++                            },
++                            main,
++                        )
++                    } catch (e: Throwable) {
++                        bar.visibility = previous
++                        onResult(null)
++                    }
++                }
++            },
++            120,
++        )
++    }
++}
++
++/** Speaks lines one after another with Gemini voices (online) or the phone's own voice. */
++private class LinePlayer(
++    private val activity: Activity,
++    private val prefs: SharedPreferences,
++    private val onChange: () -> Unit,
++) {
++    private val main = Handler(Looper.getMainLooper())
++    private val net = Executors.newFixedThreadPool(3)
++
++    private var tts: TextToSpeech? = null
++    private var ttsReady = false
++    private var ttsFailed = false
++    private var girlVoice: Voice? = null
++    private var boyVoice: Voice? = null
++    private var defaultVoice: Voice? = null
++    private var phoneVoices: List<Voice> = emptyList()
++
++    private var queue: List<Line> = emptyList()
++    private var index = 0
++    @Volatile
++    private var generation = 0
++    private var track: AudioTrack? = null
++    private var utteranceId = ""
++    private var warned = false
++
++    @Volatile
++    private var lastError: String? = null
++
++    @Volatile
++    var isPlaying = false
++        private set
++
++    init {
++        tts = TextToSpeech(activity.applicationContext) { status ->
++            if (status == TextToSpeech.SUCCESS) {
++                val engine = tts
++                engine?.setLanguage(Locale.US)
++                pickPhoneVoices(engine)
++                engine?.setOnUtteranceProgressListener(
++                    object : UtteranceProgressListener() {
++                        override fun onStart(id: String?) {}
++
++                        override fun onDone(id: String?) {
++                            main.post {
++                                if (id == utteranceId && isPlaying) {
++                                    val g = generation
++                                    index++
++                                    playPop()
++                                    main.postDelayed({ step(g) }, 150)
++                                }
++                            }
++                        }
++
++                        @Deprecated("Deprecated in Java")
++                        override fun onError(id: String?) {
++                            main.post { if (id == utteranceId) stop() }
++                        }
++                    },
++                )
++                ttsReady = true
++            } else {
++                ttsFailed = true
++            }
++        }
++    }
++
++    private fun pickPhoneVoices(engine: TextToSpeech?) {
++        try {
++            defaultVoice = engine?.defaultVoice
++            val english = (engine?.voices ?: emptySet()).filter {
++                it.locale.language == "en" && !it.isNetworkConnectionRequired
++            }
++            phoneVoices = english.sortedBy { it.name }
++            girlVoice = english.firstOrNull { it.name.contains("female", ignoreCase = true) }
++            boyVoice = english.firstOrNull {
++                it.name.contains("male", ignoreCase = true) && !it.name.contains("female", ignoreCase = true)
++            }
++        } catch (e: Throwable) {
++            // Fall back to pitch changes only.
++        }
++    }
++
++    private fun voiceName(speaker: Speaker): String? {
++        if (!prefs.getBoolean("gemini_voice_on", false)) return null
++        if (prefs.getString("api_key", "").isNullOrBlank()) return null
++        val key = when (speaker) {
++            Speaker.GIRL -> "voice_girl"
++            Speaker.BOY -> "voice_boy"
++            Speaker.CUSTOM -> "voice_custom"
++            else -> "voice_narrator"
++        }
++        val name = prefs.getString(key, DEFAULT_VOICES[key])?.trim()
++        return if (name.isNullOrEmpty()) null else name
++    }
++
++    private fun geminiOn(): Boolean =
++        prefs.getBoolean("gemini_voice_on", false) && !prefs.getString("api_key", "").isNullOrBlank()
++
++    fun play(lines: List<Line>) {
++        stopQuiet()
++        generation++
++        queue = lines
++        index = 0
++        isPlaying = true
++        warned = false
++        lastError = null
++        onChange()
++        if (geminiOn() && lines.any { it.speaker != Speaker.SKIP }) startGemini(generation) else step(generation)
++    }
++
++    /** Phone voice, line by line. Also the fallback when Gemini is unavailable. */
++    private fun step(gen: Int) {
++        if (gen != generation || !isPlaying) return
++        while (index < queue.size && queue[index].speaker == Speaker.SKIP) index++
++        if (index >= queue.size) {
++            isPlaying = false
++            onChange()
++            return
++        }
++        speakOnPhone(queue[index], gen)
++    }
++
++    private fun voiceFor(speaker: Speaker): String {
++        val mine = prefs.getString("voice_custom", "")?.trim().orEmpty()
++        if (mine.isNotEmpty() && (prefs.getBoolean("custom_all", false) || speaker == Speaker.CUSTOM)) return mine
++        return voiceName(speaker) ?: voiceName(Speaker.NARRATOR) ?: DEFAULT_VOICES.getValue("voice_narrator")
++    }
++
++    private fun labelFor(speaker: Speaker): String = when (speaker) {
++        Speaker.GIRL -> "Girl"
++        Speaker.BOY -> "Boy"
++        Speaker.CUSTOM -> "Custom"
++        else -> "Narrator"
++    }
++
++    /** One voice for the whole request (the most used one); Gemini's free plan cannot mix voices in one clip. */
++    private fun chooseVoice(lines: List<Line>): List<Pair<String, String>> {
++        val counts = LinkedHashMap<String, Int>()
++        val labels = HashMap<String, String>()
++        for (line in lines) {
++            if (line.speaker == Speaker.SKIP) continue
++            val voice = voiceFor(line.speaker)
++            counts[voice] = (counts[voice] ?: 0) + 1
++            if (!labels.containsKey(voice)) labels[voice] = labelFor(line.speaker)
++        }
++        val keep = counts.entries.sortedByDescending { it.value }.take(1).map { it.key }
++        return keep.map { (labels[it] ?: "Narrator") to it }
++    }
++
++    /** The voice, and the text cut into parts of about 2500 characters. */
++    private fun buildPlan(lines: List<Line>): Pair<List<Pair<String, String>>, List<String>> {
++        val active = lines.filter { it.speaker != Speaker.SKIP }
++        val voices = chooseVoice(active)
++        val header = "Read this manga dialogue naturally, pausing briefly between lines:\n"
++        val chunks = ArrayList<String>()
++        var current = StringBuilder(header)
++        for (line in active) {
++            if (current.length > 2500) {
++                chunks.add(current.toString().trim())
++                current = StringBuilder(header)
++            }
++            current.append(line.text).append("\n")
++        }
++        if (current.length > header.length) chunks.add(current.toString().trim())
++        return voices to chunks
++    }
++
++    // ---- page by page: ONE voice request, one clip per page ----------------------------------
++
++    private val clips = object : LinkedHashMap<String, ByteArray>(8, 0.75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean = size > 12
++    }
++    private var sessionKeys: List<String> = emptyList()
++    private val playedKeys = HashSet<String>()
++    private var keyProvider: (() -> String?)? = null
++    private var sessionActive = false
++    private var streamDone = false
++    private var clipFrames = 0
++    private var clipPlaying = false
++
++    fun clearClips() {
++        clips.clear()
++    }
++
++    /** Plays a page that was already voiced (no new request). */
++    fun playStored(key: String): Boolean {
++        val pcm = clips[key] ?: return false
++        stopQuiet()
++        generation++
++        val gen = generation
++        isPlaying = true
++        onChange()
++        startClip(pcm)
++        main.postDelayed({ pollSingle(gen) }, 250)
++        return true
++    }
++
++    private fun pollSingle(gen: Int) {
++        if (gen != generation || !isPlaying || sessionActive) return
++        updateClipState()
++        if (!clipPlaying) {
++            isPlaying = false
++            onChange()
++        } else {
++            main.postDelayed({ pollSingle(gen) }, 250)
++        }
++    }
++
++    private fun updateClipState() {
++        val t = track
++        if (clipPlaying && t != null) {
++            val head = try {
++                t.playbackHeadPosition
++            } catch (e: Throwable) {
++                clipFrames
++            }
++            if (head >= clipFrames) {
++                releaseTrack()
++                clipPlaying = false
++            }
++        }
++    }
++
++    private fun startClip(pcm: ByteArray) {
++        val size = pcm.size - pcm.size % 2
++        if (size <= 0) return
++        try {
++            releaseTrack()
++            val t = AudioTrack.Builder()
++                .setAudioAttributes(
++                    AudioAttributes.Builder()
++                        .setUsage(AudioAttributes.USAGE_MEDIA)
++                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
++                        .build(),
++                )
++                .setAudioFormat(
++                    AudioFormat.Builder()
++                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                        .setSampleRate(GeminiClient.SAMPLE_RATE)
++                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
++                        .build(),
++                )
++                .setBufferSizeInBytes(size)
++                .setTransferMode(AudioTrack.MODE_STATIC)
++                .build()
++            track = t
++            clipFrames = size / 2
++            clipPlaying = true
++            t.write(pcm, 0, size)
++            t.play()
++        } catch (e: Throwable) {
++            releaseTrack()
++            clipPlaying = false
++        }
++    }
++
++    /** Reads several pages with ONE voice request, then plays each page when you are on it. */
++    fun playPages(items: List<Pair<String, List<Line>>>, currentKey: () -> String?) {
++        stopQuiet()
++        generation++
++        val gen = generation
++        isPlaying = true
++        warned = false
++        sessionActive = true
++        streamDone = false
++        sessionKeys = items.map { it.first }
++        playedKeys.clear()
++        keyProvider = currentKey
++        queue = items.first().second.filter { it.speaker != Speaker.SKIP }
++        index = 0
++        onChange()
++        startGeminiPages(gen, items)
++        main.postDelayed({ pollPages(gen) }, 300)
++    }
++
++    private fun pollPages(gen: Int) {
++        if (gen != generation || !isPlaying || !sessionActive) return
++        updateClipState()
++        if (!clipPlaying) {
++            val key = keyProvider?.invoke()
++            val pcm = if (key != null) clips[key] else null
++            if (key != null && pcm != null && key !in playedKeys) {
++                playedKeys.add(key)
++                startClip(pcm)
++            }
++        }
++        if (streamDone && !clipPlaying && sessionKeys.all { it in playedKeys || clips[it] == null }) {
++            isPlaying = false
++            sessionActive = false
++            onChange()
++            return
++        }
++        main.postDelayed({ pollPages(gen) }, 300)
++    }
++
++    private fun startGeminiPages(gen: Int, items: List<Pair<String, List<Line>>>) {
++        val voices = chooseVoice(items.flatMap { it.second })
++        val text = StringBuilder("Read this manga dialogue naturally, pausing briefly between lines:\n")
++        for ((n, item) in items.withIndex()) {
++            if (n > 0) text.append("<long pause>\n")
++            for (line in item.second) if (line.speaker != Speaker.SKIP) text.append(line.text).append("\n")
++        }
++        val body = text.toString().trim()
++        VoiceLog.add("voice: ${voices.joinToString { it.first + "=" + it.second }}, ${body.length} chars for ${items.size} page(s)")
++        val apiKey = prefs.getString("api_key", "")?.trim().orEmpty()
++        val model = prefs.getString("tts_model", GeminiClient.DEFAULT_TTS_MODEL)?.trim().orEmpty()
++            .ifEmpty { GeminiClient.DEFAULT_TTS_MODEL }
++
++        net.execute {
++            fun alive() = gen == generation && isPlaying
++            val splitter = PageSplitter(items.size)
++            var received = 0
++            var voiceModel = model
++
++            fun emit(i: Int, raw: ByteArray) {
++                val pop = GapPop()
++                val out = ByteArrayOutputStream()
++                out.write(pop.process(raw))
++                out.write(pop.flush())
++                val clip = fadeOut(out.toByteArray())
++                val key = items[i].first
++                main.post {
++                    if (gen == generation) clips[key] = clip
++                }
++            }
++
++            fun sink(raw: ByteArray): Boolean {
++                if (!alive()) return false
++                received += raw.size
++                splitter.feed(raw) { i, seg -> emit(i, seg) }
++                return true
++            }
++
++            fun finishClips() {
++                splitter.finish { i, seg -> emit(i, seg) }
++                main.post {
++                    if (gen == generation) streamDone = true
++                }
++            }
++
++            try {
++                val cloned = voices.first().second.let { it.startsWith("voice_") || it.startsWith("voicekey_") }
++                try {
++                    if (cloned) {
++                        val cloneModel = if (voiceModel.contains("lite")) GeminiClient.FULL_TTS_MODEL else voiceModel
++                        sink(GeminiClient.synthesizeCustom(apiKey, cloneModel, voices.first().second, body))
++                    } else {
++                        GeminiClient.synthesizeStream(apiKey, voiceModel, voices, body) { sink(it) }
++                    }
++                } catch (e: GeminiException) {
++                    val hard = e.code == 401 || e.code == 403
++                    val retryable = e.code == 404 || e.code == 503 || e.code == 429
++                    if (cloned) {
++                        throw e
++                    } else if (received == 0 && retryable) {
++                        val alt = GeminiClient.pickModel(apiKey, true, voiceModel) ?: throw e
++                        if (e.code == 404) prefs.edit().putString("tts_model", alt).apply()
++                        VoiceLog.add("voice: $voiceModel failed (${e.code}), trying $alt")
++                        main.post { toast(activity, "$voiceModel is busy or missing. Trying $alt") }
++                        voiceModel = alt
++                        GeminiClient.synthesizeStream(apiKey, alt, voices, body) { sink(it) }
++                    } else if (received == 0 && !hard) {
++                        sink(GeminiClient.synthesize(apiKey, voiceModel, voices, body))
++                    } else {
++                        throw e
++                    }
++                }
++                if (received == 0) throw GeminiException("Gemini sent no audio")
++                finishClips()
++            } catch (e: Exception) {
++                VoiceLog.add("voice failed: ${e.javaClass.simpleName}: ${e.message}")
++                if (received == 0) {
++                    main.post {
++                        if (gen == generation && isPlaying) {
++                            releaseTrack()
++                            sessionActive = false
++                            if (!warned) {
++                                warned = true
++                                toast(activity, "Gemini voice unavailable (${e.message ?: "unknown"}). Using phone voice")
++                            }
++                            index = 0
++                            step(gen)
++                        }
++                    }
++                } else {
++                    finishClips()
++                }
++            }
++        }
++    }
++
++    private fun startGemini(gen: Int) {
++        val (voices, texts) = buildPlan(queue)
++        VoiceLog.add("voice: ${voices.joinToString { it.first + "=" + it.second }}, ${texts.sumOf { it.length }} chars in ${texts.size} part(s)")
++        val apiKey = prefs.getString("api_key", "")?.trim().orEmpty()
++        val model = prefs.getString("tts_model", GeminiClient.DEFAULT_TTS_MODEL)?.trim().orEmpty()
++            .ifEmpty { GeminiClient.DEFAULT_TTS_MODEL }
++
++        net.execute {
++            fun alive() = gen == generation && isPlaying
++            val pop = GapPop()
++            val preroll = ByteArrayOutputStream()
++            var audio: AudioTrack? = null
++            var frames = 0L
++            var received = 0
++            var held: ByteArray? = null
++
++            fun write(bytes: ByteArray): Boolean {
++                val t = audio ?: return false
++                var offset = 0
++                while (offset < bytes.size) {
++                    if (!alive()) return false
++                    val n = try {
++                        t.write(bytes, offset, bytes.size - offset)
++                    } catch (e: Throwable) {
++                        -1
++                    }
++                    if (n <= 0) return false
++                    offset += n
++                }
++                frames += bytes.size / 2
++                return true
++            }
++
++            fun startTrack(): Boolean {
++                if (audio != null) return true
++                val min = AudioTrack.getMinBufferSize(
++                    GeminiClient.SAMPLE_RATE,
++                    AudioFormat.CHANNEL_OUT_MONO,
++                    AudioFormat.ENCODING_PCM_16BIT,
++                )
++                val created = AudioTrack.Builder()
++                    .setAudioAttributes(
++                        AudioAttributes.Builder()
++                            .setUsage(AudioAttributes.USAGE_MEDIA)
++                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
++                            .build(),
++                    )
++                    .setAudioFormat(
++                        AudioFormat.Builder()
++                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                            .setSampleRate(GeminiClient.SAMPLE_RATE)
++                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
++                            .build(),
++                    )
++                    .setBufferSizeInBytes(maxOf(min * 4, 96000))
++                    .setTransferMode(AudioTrack.MODE_STREAM)
++                    .build()
++                audio = created
++                track = created
++                created.play()
++                return true
++            }
++
++            // Hold back the newest piece so the very end can be faded out (no click).
++            fun push(raw: ByteArray): Boolean {
++                val processed = pop.process(raw)
++                if (processed.isEmpty()) return true
++                val previous = held
++                held = processed
++                if (audio == null) {
++                    if (previous != null) preroll.write(previous)
++                    if (preroll.size() < 40000) return true
++                    startTrack()
++                    val ready = preroll.toByteArray()
++                    preroll.reset()
++                    return write(ready)
++                }
++                return previous == null || write(previous)
++            }
++
++            fun sink(raw: ByteArray): Boolean {
++                if (!alive()) return false
++                received += raw.size
++                return push(raw)
++            }
++
++            fun finish() {
++                val rest = pop.flush()
++                if (rest.isNotEmpty()) push(rest)
++                val last = held
++                held = null
++                if (last != null) preroll.write(fadeOut(last))
++                if (preroll.size() > 0) {
++                    startTrack()
++                    write(preroll.toByteArray())
++                }
++                val t = audio
++                if (t != null && alive()) {
++                    try {
++                        t.stop()
++                    } catch (e: Throwable) {
++                        // ignore
++                    }
++                    var waited = 0
++                    while (alive() && waited < 90_000) {
++                        val head = try {
++                            t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
++                        } catch (e: Throwable) {
++                            frames
++                        }
++                        if (head >= frames) break
++                        Thread.sleep(40)
++                        waited += 40
++                    }
++                }
++                main.post {
++                    if (alive()) {
++                        releaseTrack()
++                        isPlaying = false
++                        onChange()
++                    }
++                }
++            }
++
++            fun giveUp(message: String?) {
++                main.post {
++                    if (alive()) {
++                        releaseTrack()
++                        if (!warned) {
++                            warned = true
++                            toast(activity, "Gemini voice unavailable (${message ?: "unknown"}). Using phone voice")
++                        }
++                        index = 0
++                        step(gen)
++                    }
++                }
++            }
++
++            var voiceModel = model
++
++            fun speakOne(text: String, cloned: Boolean) {
++                try {
++                    if (cloned) {
++                        val cloneModel = if (voiceModel.contains("lite")) GeminiClient.FULL_TTS_MODEL else voiceModel
++                        sink(GeminiClient.synthesizeCustom(apiKey, cloneModel, voices.first().second, text))
++                    } else {
++                        GeminiClient.synthesizeStream(apiKey, voiceModel, voices, text) { sink(it) }
++                    }
++                } catch (e: GeminiException) {
++                    val hard = e.code == 401 || e.code == 403
++                    val retryable = e.code == 404 || e.code == 503 || e.code == 429
++                    if (cloned) {
++                        throw e
++                    } else if (received == 0 && retryable) {
++                        val alt = GeminiClient.pickModel(apiKey, true, voiceModel) ?: throw e
++                        if (e.code == 404) prefs.edit().putString("tts_model", alt).apply()
++                        VoiceLog.add("voice: $voiceModel failed (${e.code}), trying $alt")
++                        main.post { toast(activity, "$voiceModel is busy or missing. Trying $alt") }
++                        voiceModel = alt
++                        GeminiClient.synthesizeStream(apiKey, alt, voices, text) { sink(it) }
++                    } else if (received == 0 && !hard) {
++                        sink(GeminiClient.synthesize(apiKey, voiceModel, voices, text))
++                    } else {
++                        throw e
++                    }
++                }
++            }
++
++            try {
++                val cloned = voices.first().second.let { it.startsWith("voice_") || it.startsWith("voicekey_") }
++                for ((n, text) in texts.withIndex()) {
++                    if (!alive()) break
++                    VoiceLog.add("voice part ${n + 1}/${texts.size}")
++                    speakOne(text, cloned)
++                }
++                if (received == 0) throw GeminiException("Gemini sent no audio")
++                finish()
++            } catch (e: Exception) {
++                VoiceLog.add("voice failed: ${e.javaClass.simpleName}: ${e.message}")
++                if (received == 0) {
++                    giveUp(e.message)
++                } else {
++                    finish()
++                }
++            }
++        }
++    }
++
++    /** A short fade so the clip never ends with a click or beep. */
++    private fun fadeOut(pcm: ByteArray): ByteArray {
++        val samples = pcm.size / 2
++        val n = minOf(samples, GeminiClient.SAMPLE_RATE * 40 / 1000)
++        for (k in 0 until n) {
++            val i = (samples - n + k) * 2
++            val v = (pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)
++            val scaled = (v * (1f - (k + 1f) / n)).toInt()
++            pcm[i] = (scaled and 0xFF).toByte()
++            pcm[i + 1] = ((scaled shr 8) and 0xFF).toByte()
++        }
++        return pcm
++    }
++
++    fun phoneVoiceNames(): List<String> = phoneVoices.map { it.name }
++
++    private fun applyPhoneVoice(engine: TextToSpeech, speaker: Speaker, overrideName: String?) {
++        val prefKey = when (speaker) {
++            Speaker.GIRL -> "phone_girl"
++            Speaker.BOY -> "phone_boy"
++            else -> null
++        }
++        val wanted = overrideName ?: prefKey?.let { prefs.getString(it, "") }.orEmpty()
++        val chosen = phoneVoices.firstOrNull { wanted.isNotEmpty() && it.name == wanted }
++        val voice = chosen ?: when (speaker) {
++            Speaker.GIRL -> girlVoice
++            Speaker.BOY -> boyVoice
++            else -> null
++        }
++        if (voice != null) {
++            engine.setVoice(voice)
++            engine.setPitch(1.0f)
++        } else {
++            defaultVoice?.let { engine.setVoice(it) }
++            engine.setPitch(speaker.pitch)
++        }
++    }
++
++    /** Plays a short sample so a phone voice can be judged while choosing it in settings. */
++    fun previewPhone(speaker: Speaker, name: String) {
++        stopQuiet()
++        val engine = tts
++        if (!ttsReady || engine == null) return
++        applyPhoneVoice(engine, speaker, name)
++        engine.setSpeechRate(prefs.getFloat("speed", 1.0f))
++        utteranceId = "preview"
++        engine.speak("Hello, this is how I sound.", TextToSpeech.QUEUE_FLUSH, null, "preview")
++    }
++
++    /** A soft bubble pop between lines (phone voice mode). */
++    private fun playPop() {
++        try {
++            val t = AudioTrack.Builder()
++                .setAudioAttributes(
++                    AudioAttributes.Builder()
++                        .setUsage(AudioAttributes.USAGE_MEDIA)
++                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
++                        .build(),
++                )
++                .setAudioFormat(
++                    AudioFormat.Builder()
++                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                        .setSampleRate(GeminiClient.SAMPLE_RATE)
++                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
++                        .build(),
++                )
++                .setBufferSizeInBytes(POP.size)
++                .setTransferMode(AudioTrack.MODE_STATIC)
++                .build()
++            t.write(POP, 0, POP.size)
++            t.play()
++            main.postDelayed(
++                {
++                    try {
++                        t.release()
++                    } catch (e: Throwable) {
++                        // ignore
++                    }
++                },
++                500,
++            )
++        } catch (e: Throwable) {
++            // no pop, no problem
++        }
++    }
++
++    private fun speakOnPhone(line: Line, gen: Int) {
++        if (gen != generation || !isPlaying) return
++        if (ttsFailed) {
++            toast(activity, "Text-to-speech is not available on this phone")
++            stop()
++            return
++        }
++        val engine = tts
++        if (!ttsReady || engine == null) {
++            main.postDelayed({ speakOnPhone(line, gen) }, 300)
++            return
++        }
++        val speaker = line.speaker
++        applyPhoneVoice(engine, speaker, null)
++        engine.setSpeechRate(speaker.rate * prefs.getFloat("speed", 1.0f))
++        utteranceId = "g$gen-$index"
++        engine.speak(line.text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
++    }
++
++    private fun releaseTrack() {
++        try {
++            track?.stop()
++        } catch (e: Throwable) {
++            // already stopped
++        }
++        try {
++            track?.release()
++        } catch (e: Throwable) {
++            // already released
++        }
++        track = null
++    }
++
++    private fun stopQuiet() {
++        isPlaying = false
++        generation++
++        clipPlaying = false
++        sessionActive = false
++        streamDone = false
++        try {
++            tts?.stop()
++        } catch (e: Throwable) {
++            // ignore
++        }
++        releaseTrack()
++    }
++
++    fun stop() {
++        stopQuiet()
++        onChange()
++    }
++
++    fun shutdown() {
++        stopQuiet()
++        tts?.shutdown()
++        tts = null
++        net.shutdownNow()
++    }
++}
++
++/** A soft, short "bubble pop" (24 kHz, 16-bit mono), played in the pause between bubbles. */
++private val POP: ByteArray by lazy {
++    val rate = GeminiClient.SAMPLE_RATE
++    val n = rate * 110 / 1000
++    val out = ByteArray(n * 2)
++    var phase = 0.0
++    for (i in 0 until n) {
++        val t = i / rate.toDouble()
++        phase += 2 * PI * (260.0 + 700.0 * exp(-t / 0.018)) / rate
++        val attack = minOf(1.0, i / 48.0)
++        val v = (sin(phase) * exp(-t / 0.028) * attack * 0.20 * 32767).toInt()
++        out[i * 2] = (v and 0xFF).toByte()
++        out[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
++    }
++    out
++}
++
++/** Finds the pauses between bubbles in the speech and puts the soft pop into them. */
++private class GapPop {
++    private val window = GeminiClient.SAMPLE_RATE / 50 // 20 ms
++    private val leftover = ByteArrayOutputStream()
++    private var silent = 0
++    private var heard = false
++    private var popped = false
++
++    fun process(raw: ByteArray): ByteArray {
++        leftover.write(raw)
++        val data = leftover.toByteArray()
++        leftover.reset()
++        val size = window * 2
++        val out = ByteArrayOutputStream(data.size + POP.size)
++        var offset = 0
++        while (offset + size <= data.size) {
++            var peak = 0
++            var i = offset
++            while (i < offset + size) {
++                val v = (data[i].toInt() and 0xFF) or (data[i + 1].toInt() shl 8)
++                if (abs(v) > peak) peak = abs(v)
++                i += 2
++            }
++            out.write(data, offset, size)
++            if (peak < 500) {
++                silent++
++                if (heard && !popped && silent >= 14) {
++                    out.write(POP)
++                    popped = true
++                }
++            } else {
++                silent = 0
++                heard = true
++                popped = false
++            }
++            offset += size
++        }
++        if (offset < data.size) leftover.write(data, offset, data.size - offset)
++        return out.toByteArray()
++    }
++
++    fun flush(): ByteArray {
++        val rest = leftover.toByteArray()
++        leftover.reset()
++        return rest
++    }
++}
++
++/** Cuts one long speech clip into one clip per page, at the long pauses between pages. */
++private class PageSplitter(private val pages: Int) {
++    private val window = GeminiClient.SAMPLE_RATE / 50 // 20 ms
++    private val leftover = ByteArrayOutputStream()
++    private var current = ByteArrayOutputStream()
++    private var silent = 0
++    private var heard = 0
++    private var index = 0
++
++    fun feed(raw: ByteArray, emit: (Int, ByteArray) -> Unit) {
++        leftover.write(raw)
++        val data = leftover.toByteArray()
++        leftover.reset()
++        val size = window * 2
++        var offset = 0
++        while (offset + size <= data.size) {
++            var peak = 0
++            var i = offset
++            while (i < offset + size) {
++                val v = (data[i].toInt() and 0xFF) or (data[i + 1].toInt() shl 8)
++                if (abs(v) > peak) peak = abs(v)
++                i += 2
++            }
++            current.write(data, offset, size)
++            if (peak < 500) {
++                silent++
++                if (index < pages - 1 && silent >= 45 && heard >= 100) {
++                    emit(index, current.toByteArray())
++                    current = ByteArrayOutputStream()
++                    index++
++                    heard = 0
++                    silent = 0
++                }
++            } else {
++                silent = 0
++                heard++
++            }
++            offset += size
++        }
++        if (offset < data.size) leftover.write(data, offset, data.size - offset)
++    }
++
++    fun finish(emit: (Int, ByteArray) -> Unit) {
++        current.write(leftover.toByteArray())
++        leftover.reset()
++        if (current.size() > 0 && index < pages) emit(index, current.toByteArray())
++        current = ByteArrayOutputStream()
++        index = pages
++    }
++}
++
++/** Lines found on the page, so the speaker of any line can be fixed. Opened by holding Listen. */
++private class LinesDialog(
++    private val activity: Activity,
++    private val prefs: SharedPreferences,
++    private val player: LinePlayer,
++    private val lines: MutableList<Line>,
++) {
++    private val list = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
++    private val density = activity.resources.displayMetrics.density
++
++    private fun dp(value: Int) = (value * density).toInt()
++
++    private fun label(message: String, sp: Float, bold: Boolean = false) = TextView(activity).apply {
++        text = message
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
++        if (bold) typeface = Typeface.DEFAULT_BOLD
++    }
++
++    private fun button(message: String, color: Int, onClick: (Button) -> Unit) = Button(activity).apply {
++        text = message
++        isAllCaps = false
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
++        typeface = Typeface.DEFAULT_BOLD
++        minHeight = dp(44)
++        background = roundedBackground(color, dp(10))
++        setOnClickListener { onClick(this) }
++    }
++
++    private fun arrow(symbol: String, onClick: () -> Unit) = TextView(activity).apply {
++        text = symbol
++        gravity = Gravity.CENTER
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
++        background = roundedBackground(0xFF424242.toInt(), dp(8))
++        setOnClickListener { onClick() }
++    }
++
++    private fun render() {
++        list.removeAllViews()
++        for ((position, line) in lines.withIndex()) {
++            val row = LinearLayout(activity).apply {
++                orientation = LinearLayout.HORIZONTAL
++                gravity = Gravity.CENTER_VERTICAL
++                setPadding(0, dp(6), 0, dp(6))
++            }
++            val who = button(line.speaker.emoji + " " + line.speaker.label, line.speaker.color) { b ->
++                line.speaker = line.speaker.next()
++                b.text = line.speaker.emoji + " " + line.speaker.label
++                b.background = roundedBackground(line.speaker.color, dp(10))
++            }
++            val text = label(line.text, 18f).apply {
++                maxLines = 4
++                ellipsize = TextUtils.TruncateAt.END
++                setPadding(dp(12), 0, 0, 0)
++                setOnClickListener { player.play(listOf(Line(line.text, line.speaker))) }
++            }
++            row.addView(who, LinearLayout.LayoutParams(dp(130), ViewGroup.LayoutParams.WRAP_CONTENT))
++            row.addView(text, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
++            val up = arrow("▲") {
++                if (position > 0) {
++                    Collections.swap(lines, position, position - 1)
++                    render()
++                }
++            }
++            val down = arrow("▼") {
++                if (position < lines.size - 1) {
++                    Collections.swap(lines, position, position + 1)
++                    render()
++                }
++            }
++            for (a in listOf(up, down)) {
++                row.addView(a, LinearLayout.LayoutParams(dp(40), dp(40)).apply { setMargins(dp(4), 0, 0, 0) })
++            }
++            list.addView(row)
++        }
++    }
++
++    fun show() {
++        val root = LinearLayout(activity).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(dp(18), dp(16), dp(18), dp(12))
++        }
++        val dialog = AlertDialog.Builder(activity)
++            .setView(root)
++            .setOnDismissListener { player.stop() }
++            .create()
++        dialog.window?.setBackgroundDrawable(roundedBackground(0xFF202124.toInt(), dp(16)))
++
++        val hint = label(
++            "Tap a name to change who speaks. Tap a line to hear just that one. Use the arrows to fix the order. A ? means the AI was not sure.",
++            15f,
++        ).apply { setTextColor(0xFFCCCCCC.toInt()) }
++        val scroll = ScrollView(activity).apply { addView(list) }
++
++        val buttons = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
++        val play = button("Play all", 0xFF3949AB.toInt()) { player.play(lines.map { Line(it.text, it.speaker, it.sfx) }) }
++        val stop = button("Stop", 0xFFD32F2F.toInt()) { player.stop() }
++        val close = button("Close", 0xFF424242.toInt()) { dialog.dismiss() }
++        val gap = dp(4)
++        for (b in listOf(play, stop, close)) {
++            buttons.addView(
++                b,
++                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
++                    setMargins(gap, 0, gap, 0)
++                },
++            )
++        }
++
++        root.addView(label("Lines on this page", 22f, bold = true))
++        root.addView(hint)
++        root.addView(
++            scroll,
++            LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT,
++                (activity.resources.displayMetrics.heightPixels * 0.5f).toInt(),
++            ).apply { setMargins(0, dp(8), 0, dp(8)) },
++        )
++        root.addView(buttons)
++
++        render()
++        dialog.show()
++    }
++}
++
++/** Live log: refreshes every second while open, so errors show up as they happen. */
++private fun showLog(activity: Activity) {
++    val density = activity.resources.displayMetrics.density
++    fun dp(value: Int) = (value * density).toInt()
++    val handler = Handler(Looper.getMainLooper())
++
++    val view = TextView(activity).apply {
++        setTextColor(0xFFDDDDDD.toInt())
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
++        typeface = Typeface.MONOSPACE
++        setTextIsSelectable(true)
++    }
++    val scroll = ScrollView(activity).apply { addView(view) }
++    val root = LinearLayout(activity).apply {
++        orientation = LinearLayout.VERTICAL
++        setPadding(dp(14), dp(14), dp(14), dp(10))
++    }
++    val dialog = AlertDialog.Builder(activity).setView(root).create()
++    dialog.window?.setBackgroundDrawable(roundedBackground(0xFF202124.toInt(), dp(16)))
++
++    fun refresh() {
++        val text = VoiceLog.text()
++        if (view.text.toString() != text) {
++            view.text = text
++            scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
++        }
++    }
++
++    fun smallButton(label: String, color: Int, onClick: () -> Unit) = Button(activity).apply {
++        text = label
++        isAllCaps = false
++        setTextColor(Color.WHITE)
++        background = roundedBackground(color, dp(10))
++        setOnClickListener { onClick() }
++    }
++
++    val buttons = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
++    val copy = smallButton("Copy", 0xFF3949AB.toInt()) {
++        val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
++        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("voice log", VoiceLog.text()))
++        toast(activity, "Log copied")
++    }
++    val clear = smallButton("Clear", 0xFF8E24AA.toInt()) {
++        VoiceLog.clear()
++        refresh()
++    }
++    val close = smallButton("Close", 0xFF424242.toInt()) { dialog.dismiss() }
++    val gap = dp(4)
++    for (b in listOf(copy, clear, close)) {
++        buttons.addView(
++            b,
++            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(gap, 0, gap, 0) },
++        )
++    }
++
++    val title = TextView(activity).apply {
++        text = "Live log"
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
++        typeface = Typeface.DEFAULT_BOLD
++    }
++    root.addView(title)
++    root.addView(
++        scroll,
++        LinearLayout.LayoutParams(
++            ViewGroup.LayoutParams.MATCH_PARENT,
++            (activity.resources.displayMetrics.heightPixels * 0.55f).toInt(),
++        ).apply { setMargins(0, dp(8), 0, dp(8)) },
++    )
++    root.addView(buttons)
++
++    val ticker = object : Runnable {
++        override fun run() {
++            refresh()
++            handler.postDelayed(this, 1000)
++        }
++    }
++    dialog.setOnDismissListener { handler.removeCallbacks(ticker) }
++    dialog.show()
++    ticker.run()
++}
++
++/** Key, models, voice names, cast and speed. Everything is stored only on this phone. */
++private fun showSettings(activity: Activity, prefs: SharedPreferences, player: LinePlayer) {
++    val density = activity.resources.displayMetrics.density
++    fun dp(value: Int) = (value * density).toInt()
++
++    val root = LinearLayout(activity).apply {
++        orientation = LinearLayout.VERTICAL
++        setPadding(dp(18), dp(16), dp(18), dp(12))
++    }
++    val scroll = ScrollView(activity).apply { addView(root) }
++    val dialog = AlertDialog.Builder(activity).setView(scroll).create()
++    dialog.window?.setBackgroundDrawable(roundedBackground(0xFF202124.toInt(), dp(16)))
++
++    fun title(message: String) = TextView(activity).apply {
++        text = message
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
++        typeface = Typeface.DEFAULT_BOLD
++    }
++
++    fun caption(message: String) = TextView(activity).apply {
++        text = message
++        setTextColor(0xFFCCCCCC.toInt())
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
++        setPadding(0, dp(12), 0, 0)
++    }
++
++    fun field(hint: String, value: String, secret: Boolean = false, multiline: Boolean = false) =
++        EditText(activity).apply {
++            setText(value)
++            this.hint = hint
++            setTextColor(Color.WHITE)
++            setHintTextColor(0xFF888888.toInt())
++            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
++            inputType = when {
++                secret -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
++                multiline -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
++                else -> InputType.TYPE_CLASS_TEXT
++            }
++            if (multiline) minLines = 3
++        }
++
++    val keyField = field("Paste your Google key", prefs.getString("api_key", "").orEmpty(), secret = true)
++    val modelField = field(GeminiClient.DEFAULT_MODEL, prefs.getString("model", GeminiClient.DEFAULT_MODEL).orEmpty())
++    val castField = field(
++        "Example: Kagari is the long-haired girl. Nana-kun is the short-haired boy.",
++        prefs.getString("cast", "").orEmpty(),
++        multiline = true,
++    )
++    val geminiVoices = CheckBox(activity).apply {
++        text = "Use Gemini voice (natural, but limited: about 100 pages a day, one voice per page)"
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
++        isChecked = prefs.getBoolean("gemini_voice_on", false)
++    }
++    val ttsField = field(
++        GeminiClient.DEFAULT_TTS_MODEL,
++        prefs.getString("tts_model", GeminiClient.DEFAULT_TTS_MODEL).orEmpty(),
++    )
++    val voiceFields = linkedMapOf(
++        "voice_girl" to "Girl voice name",
++        "voice_boy" to "Boy voice name",
++        "voice_narrator" to "Narrator voice name (also used for ? lines)",
++        "voice_custom" to "Custom voice name (leave empty to use the phone voice)",
++    ).mapValues { (key, hint) ->
++        field(hint, prefs.getString(key, DEFAULT_VOICES[key]).orEmpty())
++    }
++    fun plainButton(label: String, color: Int = 0xFF3949AB.toInt()) = Button(activity).apply {
++        text = label
++        isAllCaps = false
++        setTextColor(Color.WHITE)
++        background = roundedBackground(color, dp(10))
++    }
++
++    var sourceUri: Uri? = null
++    var consentUri: Uri? = null
++    val sourceButton = plainButton("1. Pick my voice recording (10-30 s)")
++    val consentButton = plainButton("2. Pick my consent recording")
++    val recordButton = plainButton("Record the consent line now", 0xFF8E24AA.toInt())
++    val createButton = plainButton("3. Create my voice", 0xFF43A047.toInt())
++    val batchChoices = listOf(1, 2, 3, 5)
++    var batchPages = prefs.getInt("batch_pages", 3)
++    val batchButton = plainButton("")
++    fun batchLabel() = "Pages per Gemini voice request: $batchPages" +
++        if (batchPages != 1) " (plays one page at a time)" else ""
++    batchButton.text = batchLabel()
++    batchButton.setOnClickListener {
++        batchPages = batchChoices[(batchChoices.indexOf(batchPages) + 1) % batchChoices.size]
++        prefs.edit().putInt("batch_pages", batchPages).apply()
++        batchButton.text = batchLabel()
++    }
++    val directions = listOf("auto", "rtl", "ltr")
++    val directionNames = mapOf(
++        "auto" to "Auto",
++        "rtl" to "Right to left (manga)",
++        "ltr" to "Left to right (comic)",
++    )
++    var direction = prefs.getString("direction", "auto").orEmpty()
++    val directionButton = plainButton("")
++    fun directionLabel() = "Reading direction: " + (directionNames[direction] ?: "Auto")
++    directionButton.text = directionLabel()
++    directionButton.setOnClickListener {
++        direction = directions[(directions.indexOf(direction) + 1) % directions.size]
++        prefs.edit().putString("direction", direction).apply()
++        directionButton.text = directionLabel()
++    }
++    val sfxBox = CheckBox(activity).apply {
++        text = "Read sound effects out loud (Shf, Eesh...)"
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
++        isChecked = prefs.getBoolean("read_sfx", true)
++    }
++    val customAll = CheckBox(activity).apply {
++        text = "Use my voice for every line (instead of girl/boy voices)"
++        setTextColor(Color.WHITE)
++        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
++        isChecked = prefs.getBoolean("custom_all", false)
++    }
++    val launchers = ArrayList<ActivityResultLauncher<*>>()
++    val registry = (activity as? ComponentActivity)?.activityResultRegistry
++    if (registry != null) {
++        val stamp = System.nanoTime()
++        val pickSource = registry.register("voice_src_$stamp", ActivityResultContracts.OpenDocument()) { uri ->
++            if (uri != null) {
++                sourceUri = uri
++                sourceButton.text = "1. Voice recording picked"
++            }
++        }
++        val pickConsent = registry.register("voice_con_$stamp", ActivityResultContracts.OpenDocument()) { uri ->
++            if (uri != null) {
++                consentUri = uri
++                consentButton.text = "2. Consent recording picked"
++            }
++        }
++        val record = registry.register("voice_rec_$stamp", ActivityResultContracts.StartActivityForResult()) { result ->
++            val uri = result.data?.data
++            if (uri != null) {
++                consentUri = uri
++                consentButton.text = "2. Consent recording picked"
++            } else {
++                toast(activity, "No recording came back. Record it in your recorder app and use step 2")
++            }
++        }
++        launchers.add(pickSource)
++        launchers.add(pickConsent)
++        launchers.add(record)
++        sourceButton.setOnClickListener { pickSource.launch(arrayOf("audio/*")) }
++        consentButton.setOnClickListener { pickConsent.launch(arrayOf("audio/*")) }
++        recordButton.setOnClickListener {
++            try {
++                record.launch(Intent(MediaStore.Audio.Media.RECORD_SOUND_ACTION))
++            } catch (e: Throwable) {
++                toast(activity, "No recorder app found. Record it in your own recorder and use step 2")
++            }
++        }
++    }
++    dialog.setOnDismissListener { for (launcher in launchers) launcher.unregister() }
++    createButton.setOnClickListener {
++        val source = sourceUri
++        val consent = consentUri
++        val typedKey = keyField.text.toString().trim()
++        val key = typedKey.ifEmpty { prefs.getString("api_key", "").orEmpty() }
++        if (source == null || consent == null) {
++            toast(activity, "Pick both recordings first (steps 1 and 2)")
++        } else if (key.isEmpty()) {
++            toast(activity, "Paste your Google key first")
++        } else {
++            createButton.isEnabled = false
++            createButton.text = "Creating your voice..."
++            val typedModel = ttsField.text.toString().trim().ifEmpty { GeminiClient.DEFAULT_TTS_MODEL }
++            val model = if (typedModel.contains("lite")) GeminiClient.FULL_TTS_MODEL else typedModel
++            val handler = Handler(Looper.getMainLooper())
++            Thread {
++                try {
++                    val sourceWav = VoiceClone.toWav(activity, source, 30, 10)
++                    val consentWav = VoiceClone.toWav(activity, consent, 20, 2)
++                    VoiceLog.add("clone: sending ${sourceWav.size / 1024} KB + ${consentWav.size / 1024} KB")
++                    val id = GeminiClient.createVoice(key, model, sourceWav, consentWav)
++                    VoiceLog.add("clone: made $id")
++                    handler.post {
++                        prefs.edit()
++                            .putString("api_key", key)
++                            .putString("voice_custom", id)
++                            .putBoolean("custom_all", true)
++                            .putBoolean("gemini_voice_on", true)
++                            .apply()
++                        voiceFields.getValue("voice_custom").setText(id)
++                        customAll.isChecked = true
++                        geminiVoices.isChecked = true
++                        createButton.isEnabled = true
++                        createButton.text = "3. Voice created (make another)"
++                        toast(activity, "Your voice is ready. Press Save, then Listen")
++                    }
++                } catch (e: Exception) {
++                    VoiceLog.add("clone failed: ${e.javaClass.simpleName}: ${e.message}")
++                    val message = when (e) {
++                        is GeminiException -> e.message
++                        is IllegalArgumentException -> e.message
++                        is IOException -> "Could not reach Google. Check your internet"
++                        else -> "Could not make the voice: ${e.message}"
++                    }
++                    handler.post {
++                        createButton.isEnabled = true
++                        createButton.text = "3. Create my voice"
++                        toast(activity, message ?: "Could not make the voice")
++                    }
++                }
++            }.start()
++        }
++    }
++
++    fun pickerButton(prefKey: String, who: String, speaker: Speaker): Button {
++        var current = prefs.getString(prefKey, "").orEmpty()
++        fun title() = "$who phone voice: " + (if (current.isEmpty()) "Auto" else current.take(24))
++        return Button(activity).apply {
++            text = title()
++            isAllCaps = false
++            setTextColor(Color.WHITE)
++            background = roundedBackground(0xFF3949AB.toInt(), dp(10))
++            setOnClickListener {
++                val names = player.phoneVoiceNames()
++                if (names.isEmpty()) {
++                    toast(activity, "Phone voices are not ready yet. Try again in a moment")
++                } else {
++                    val options = listOf("") + names
++                    val next = (options.indexOf(current) + 1) % options.size
++                    current = options[next]
++                    prefs.edit().putString(prefKey, current).apply()
++                    text = title()
++                    player.previewPhone(speaker, current)
++                }
++            }
++        }
++    }
++    val girlPicker = pickerButton("phone_girl", "Girl", Speaker.GIRL)
++    val boyPicker = pickerButton("phone_boy", "Boy", Speaker.BOY)
++    var speed = prefs.getFloat("speed", 1.0f)
++    fun speedLabel() = "Phone voice speed: " + (SPEED_LABELS.firstOrNull { it.second == speed }?.first ?: "Normal")
++    val speedButton = Button(activity).apply {
++        text = speedLabel()
++        isAllCaps = false
++        setTextColor(Color.WHITE)
++        background = roundedBackground(0xFF3949AB.toInt(), dp(10))
++        setOnClickListener {
++            val i = SPEED_LABELS.indexOfFirst { it.second == speed }
++            speed = SPEED_LABELS[(i + 1) % SPEED_LABELS.size].second
++            text = speedLabel()
++        }
++    }
++
++    root.addView(title("Voice settings"))
++    root.addView(caption("Google key (free, from aistudio.google.com). It stays only on this phone."))
++    root.addView(keyField)
++    root.addView(caption("Reading model (finds the text and who speaks)"))
++    root.addView(modelField)
++    root.addView(
++        directionButton,
++        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++            .apply { setMargins(0, dp(6), 0, 0) },
++    )
++    root.addView(sfxBox)
++    root.addView(caption("Characters, so the AI can tell them apart (optional)"))
++    root.addView(castField)
++    root.addView(geminiVoices)
++    root.addView(
++        batchButton,
++        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++            .apply { setMargins(0, dp(6), 0, 0) },
++    )
++    root.addView(caption("Voice model"))
++    root.addView(ttsField)
++    for ((_, view) in voiceFields) root.addView(view)
++    root.addView(caption("My own voice (Google makes a copy of YOUR voice; it needs your spoken consent)"))
++    root.addView(
++        caption(
++            "Say this in your voice and record it: \"I am the owner of this voice and I consent to Google using " +
++                "this voice to create a synthetic voice model.\"",
++        ),
++    )
++    for (b in listOf(sourceButton, consentButton, recordButton, createButton)) {
++        root.addView(
++            b,
++            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++                .apply { setMargins(0, dp(6), 0, 0) },
++        )
++    }
++    root.addView(customAll)
++    root.addView(
++        girlPicker,
++        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++            .apply { setMargins(0, dp(12), 0, 0) },
++    )
++    root.addView(
++        boyPicker,
++        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++            .apply { setMargins(0, dp(6), 0, 0) },
++    )
++    root.addView(
++        speedButton,
++        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++            .apply { setMargins(0, dp(12), 0, 0) },
++    )
++
++    val buttons = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
++    val save = Button(activity).apply {
++        text = "Save"
++        isAllCaps = false
++        setTextColor(Color.WHITE)
++        background = roundedBackground(0xFF3949AB.toInt(), dp(10))
++        setOnClickListener {
++            val edit = prefs.edit()
++                .putString("api_key", keyField.text.toString().trim())
++                .putString("model", modelField.text.toString().trim())
++                .putString("cast", castField.text.toString().trim())
++                .putBoolean("gemini_voice_on", geminiVoices.isChecked)
++                .putBoolean("custom_all", customAll.isChecked)
++                .putBoolean("read_sfx", sfxBox.isChecked)
++                .putString("tts_model", ttsField.text.toString().trim())
++                .putFloat("speed", speed)
++            for ((key, view) in voiceFields) edit.putString(key, view.text.toString().trim())
++            edit.apply()
++            player.clearClips()
++            dialog.dismiss()
++            toast(activity, "Saved")
++        }
++    }
++    val cancel = Button(activity).apply {
++        text = "Cancel"
++        isAllCaps = false
++        setTextColor(Color.WHITE)
++        background = roundedBackground(0xFF424242.toInt(), dp(10))
++        setOnClickListener { dialog.dismiss() }
++    }
++    val gap = dp(4)
++    for (b in listOf(save, cancel)) {
++        buttons.addView(
++            b,
++            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(gap, 0, gap, 0) },
++        )
++    }
++    root.addView(
++        buttons,
++        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++            .apply { setMargins(0, dp(16), 0, 0) },
++    )
++    dialog.show()
++}
